@@ -10,6 +10,21 @@ description = "SQLite storage layer with single-writer actor and FTS5/sqlite-vec
 
 [dependencies]
 ai-memory-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+rusqlite.workspace = true
+refinery.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

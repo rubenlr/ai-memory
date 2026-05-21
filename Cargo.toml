@@ -58,6 +58,12 @@ dirs = "5"
 # Secrets.
 secrecy = { version = "0.10", features = ["serde"] }
 
+# Storage.
+rusqlite = { version = "0.32", features = ["bundled"] }
+refinery = { version = "0.8", features = ["rusqlite"] }
+sha2 = "0.10"
+parking_lot = "0.12"
+
 # Testing.
 tempfile = "3"
 

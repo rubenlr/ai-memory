@@ -27,6 +27,24 @@ macro_rules! id_newtype {
             pub fn new() -> Self {
                 Self(Uuid::now_v7())
             }
+
+            /// Borrow the raw 16-byte big-endian representation.
+            #[must_use]
+            pub fn as_bytes(&self) -> &[u8; 16] {
+                self.0.as_bytes()
+            }
+
+            /// Reconstruct from a 16-byte slice (typically read from
+            /// SQLite as a `BLOB`).
+            ///
+            /// # Errors
+            /// Returns [`MemoryError::MalformedRecord`] if the slice is
+            /// not exactly 16 bytes.
+            pub fn from_slice(bytes: &[u8]) -> Result<Self, MemoryError> {
+                Uuid::from_slice(bytes)
+                    .map(Self)
+                    .map_err(|e| MemoryError::MalformedRecord(format!("invalid uuid bytes: {e}")))
+            }
         }
 
         impl Default for $name {
@@ -62,6 +80,7 @@ id_newtype!(pub WorkspaceId, "Workspace identifier (top of the 3-tuple).");
 id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
+id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 
 /// Relative path of a page within the wiki tree.
 ///
