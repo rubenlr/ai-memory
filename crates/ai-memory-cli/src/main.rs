@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
+        Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
         Command::Commit(args) => commands::commit::run(&config, args),
         Command::LlmTest(args) => commands::llm_test::run(&config, args).await,
         Command::ForgetSweep(args) => commands::forget_sweep::run(&config, args).await,

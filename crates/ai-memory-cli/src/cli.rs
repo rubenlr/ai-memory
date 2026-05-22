@@ -47,6 +47,10 @@ pub enum Command {
     Restore(RestoreArgs),
     /// Print (or apply) lifecycle-hook configuration for an agent CLI.
     InstallHooks(InstallHooksArgs),
+    /// Print MCP server registration snippets for any supported client
+    /// (Claude Code, Codex, OpenCode, Cursor, Claude Desktop, Gemini
+    /// CLI, OpenClaw, pi). See docs/mcp-install.md for the full guide.
+    InstallMcp(InstallMcpArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
     /// Smoke-test an LLM provider by sending one prompt.
@@ -126,7 +130,9 @@ pub struct RestoreArgs {
     pub force: bool,
 }
 
-/// Agent CLI to install hooks for.
+/// Agent CLI to install hooks for. Only the three with lifecycle
+/// hooks are listed; for MCP-only clients (Cursor, Claude Desktop,
+/// Gemini CLI, OpenClaw), use `install-mcp --client <name>` instead.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum AgentChoice {
     /// Anthropic Claude Code.
@@ -135,6 +141,33 @@ pub enum AgentChoice {
     Codex,
     /// OpenCode (open-source coding agent).
     OpenCode,
+}
+
+/// MCP client to render configuration for. Includes both the
+/// hook-capable agents (Claude Code / Codex / OpenCode — same MCP
+/// surface, also covered by `install-hooks`) and the MCP-only
+/// clients researched in docs/mcp-install.md.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum McpClient {
+    /// Anthropic Claude Code — `claude mcp add`.
+    ClaudeCode,
+    /// OpenAI Codex CLI — `~/.codex/config.toml`.
+    Codex,
+    /// OpenCode — `opencode.json`.
+    OpenCode,
+    /// Cursor IDE — `~/.cursor/mcp.json` or `.cursor/mcp.json`.
+    Cursor,
+    /// Anthropic Claude Desktop — uses the `mcp-remote` stdio shim
+    /// to talk to ai-memory's HTTP endpoint (Claude Desktop's JSON
+    /// config does not register HTTP transports directly).
+    ClaudeDesktop,
+    /// Google Gemini CLI — `~/.gemini/settings.json`.
+    GeminiCli,
+    /// OpenClaw personal AI gateway — `~/.openclaw/config.json`.
+    Openclaw,
+    /// Mario Zechner's `pi` coding agent. NOT supported via MCP
+    /// upstream; this prints the explanation + alternatives.
+    Pi,
 }
 
 /// Arguments for `commit`.
@@ -229,6 +262,20 @@ pub struct InstallHooksArgs {
     /// Server URL the hooks will POST to.
     #[arg(long, default_value = "http://127.0.0.1:49374")]
     pub server_url: String,
+}
+
+/// Arguments for `install-mcp`.
+#[derive(Debug, Args)]
+pub struct InstallMcpArgs {
+    /// Which MCP client to render configuration for.
+    #[arg(long, value_enum, default_value_t = McpClient::ClaudeCode)]
+    pub client: McpClient,
+    /// MCP HTTP endpoint URL the client should connect to.
+    #[arg(long, default_value = "http://127.0.0.1:49374/mcp")]
+    pub server_url: String,
+    /// Friendly name the client should show for this server entry.
+    #[arg(long, default_value = "ai-memory")]
+    pub name: String,
 }
 
 /// Transport for the MCP server.

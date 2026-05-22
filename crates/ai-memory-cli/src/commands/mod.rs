@@ -6,6 +6,7 @@ pub mod embed;
 pub mod forget_sweep;
 pub mod init;
 pub mod install_hooks;
+pub mod install_mcp;
 pub mod lint;
 pub mod llm_test;
 pub mod reset;

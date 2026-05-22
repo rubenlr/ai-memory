@@ -118,6 +118,28 @@ url = "http://127.0.0.1:49374/mcp"
 ~/.ai-memory/target/release/ai-memory install-hooks --agent opencode
 ```
 
+### Other MCP clients — Cursor, Claude Desktop, Gemini CLI, OpenClaw, pi
+
+These clients don't currently have lifecycle-hook bundles in
+`hooks/`, but ai-memory still works with them via MCP. See
+[**`docs/mcp-install.md`**](docs/mcp-install.md) for the per-client
+config-file path and snippet.
+
+Quick reference:
+
+```bash
+ai-memory install-mcp --client cursor          # ~/.cursor/mcp.json
+ai-memory install-mcp --client claude-desktop  # Claude Desktop config
+ai-memory install-mcp --client gemini-cli      # ~/.gemini/settings.json
+ai-memory install-mcp --client openclaw        # ~/.openclaw/config.json
+ai-memory install-mcp --client pi              # prints why pi is not MCP-supported
+```
+
+The MCP-only clients get the read/query side (the LLM can call
+`memory_query`, `memory_recent`, `memory_handoff_accept`), but not
+auto-capture — you nudge the model to call those tools yourself
+(see [the CLAUDE.md snippet](#nudging-the-agent-to-use-memory-proactively)).
+
 ## LLM provider, models, and API keys
 
 ai-memory works in three intensity tiers. **The default Docker run is
