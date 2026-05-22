@@ -57,6 +57,10 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
+# Format-preserving TOML editor for install-mcp --apply against
+# Codex's config.toml. Plain `toml` round-trips destroy comments;
+# `toml_edit` doesn't.
+toml_edit = "0.22"
 
 # Secrets + constant-time / RNG primitives for bearer-token auth.
 secrecy = { version = "0.10", features = ["serde"] }

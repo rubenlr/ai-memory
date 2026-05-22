@@ -9,9 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, InstallHooksArgs};
+use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
 use crate::commands::render_shared::build_claude_code_payload;
 use crate::config::Config;
 
@@ -22,11 +23,73 @@ use crate::config::Config;
 pub fn run(_config: &Config, args: InstallHooksArgs) -> Result<()> {
     let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
     let auth = args.auth_token.as_deref();
+    if args.apply {
+        if !matches!(args.agent, AgentChoice::ClaudeCode) {
+            bail!(
+                "--apply currently only supports --agent claude-code. Codex / OpenCode \
+                 hook config formats are still evolving upstream; print the snippet \
+                 (drop --apply) and merge by hand."
+            );
+        }
+        return apply_to_claude_code_settings(&hooks_dir, &args.server_url, auth, &args);
+    }
     match args.agent {
         AgentChoice::ClaudeCode => render_claude_code(&hooks_dir, &args.server_url, auth),
         AgentChoice::Codex => render_agent("codex", &hooks_dir, &args.server_url, auth),
         AgentChoice::OpenCode => render_agent("opencode", &hooks_dir, &args.server_url, auth),
     }
+}
+
+/// Mutate `~/.claude/settings.json` in place: replace the seven hook
+/// entries ai-memory cares about; preserve every other hook the user
+/// has wired up to other tools.
+fn apply_to_claude_code_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => dirs::home_dir()
+            .context("could not locate $HOME for ~/.claude/settings.json")?
+            .join(".claude")
+            .join("settings.json"),
+    };
+    let payload = build_claude_code_payload(hooks_dir, server_url, auth_token);
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .context("internal: build_claude_code_payload didn't return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            // Get-or-create the top-level `hooks` table, then OVERLAY
+            // our seven event keys onto the user's table. Anything
+            // they had under a non-overlapping event name (e.g. a
+            // hand-written "Notification" hook) survives.
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in settings.json but not an object")?;
+            for (event, value) in &our_hooks {
+                hooks.insert(event.clone(), value.clone());
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
 }
 
 fn render_agent(

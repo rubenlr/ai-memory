@@ -74,6 +74,30 @@ pub enum Command {
     /// project that's been around for a while. Requires
     /// AI_MEMORY_LLM_PROVIDER configured on the server.
     Bootstrap(BootstrapArgs),
+    /// Install the ai-memory usage snippet into the project's
+    /// CLAUDE.md / AGENTS.md (or any markdown file you specify).
+    /// Idempotent — bracketed by `<!-- ai-memory:start -->` /
+    /// `<!-- ai-memory:end -->` markers so re-running replaces the
+    /// block in place without duplicating.
+    InstallInstructions(InstallInstructionsArgs),
+}
+
+/// Arguments for `install-instructions`.
+#[derive(Debug, Args)]
+pub struct InstallInstructionsArgs {
+    /// Markdown file to write into. Defaults to `$PWD/CLAUDE.md`.
+    /// Use `--target AGENTS.md` for non-Claude agents, or any other
+    /// path for project-rules files (`.cursor/rules`,
+    /// `.windsurfrules`, etc.).
+    #[arg(long, default_value = "CLAUDE.md")]
+    pub target: PathBuf,
+    /// Print the snippet to stdout instead of mutating the file.
+    /// The default IS mutation here (the print form is also
+    /// available without this command — copy the block from the
+    /// README). Pass `--print` to preview what would land in
+    /// the file.
+    #[arg(long)]
+    pub print: bool,
 }
 
 /// Arguments for `bootstrap`.
@@ -380,6 +404,19 @@ pub struct InstallHooksArgs {
     /// is set there. Generate one with `ai-memory generate-auth-token`.
     #[arg(long, env = "AI_MEMORY_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
+    /// **Mutate** ~/.claude/settings.json in place instead of just
+    /// printing the snippet. Idempotent — replaces the seven hook
+    /// entries (SessionStart, UserPromptSubmit, …) and preserves
+    /// any other hook config the user has. Only supported for
+    /// `--agent claude-code` today; Codex / OpenCode hook config
+    /// formats are still in flux upstream, so they keep the print
+    /// path. A timestamped backup is written next to the original.
+    #[arg(long)]
+    pub apply: bool,
+    /// Override the settings.json path (auto-detected as
+    /// `~/.claude/settings.json`).
+    #[arg(long)]
+    pub config_file: Option<PathBuf>,
 }
 
 /// Arguments for `install-mcp`.
@@ -400,6 +437,17 @@ pub struct InstallMcpArgs {
     /// requires it. Picked up from `AI_MEMORY_AUTH_TOKEN` if unset.
     #[arg(long, env = "AI_MEMORY_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
+    /// **Mutate** the client's config file in place instead of just
+    /// printing the snippet. Idempotent: replaces any existing entry
+    /// named `<name>` (default `ai-memory`); preserves every other
+    /// MCP server the user has configured. A timestamped backup is
+    /// written next to the original before each modifying write.
+    #[arg(long)]
+    pub apply: bool,
+    /// Override the config-file path. Auto-detected per client when
+    /// absent (e.g. `~/.claude/settings.json` for Claude Code).
+    #[arg(long)]
+    pub config_file: Option<PathBuf>,
 }
 
 /// Transport for the MCP server.

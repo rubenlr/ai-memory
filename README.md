@@ -50,21 +50,31 @@ docker run -d --name ai-memory \
 #    OpenCode, Cursor, Claude Desktop, Gemini CLI, OpenClaw, see
 #    docs/install.md.
 
-# 3a. Register the MCP endpoint
-claude mcp add --transport http ai-memory http://localhost:49374/mcp \
-    --header "Authorization: Bearer $TOKEN"
+# 3a. Register the MCP endpoint (auto-edits ~/.claude/settings.json)
+docker run --rm -v "$HOME:/host" akitaonrails/ai-memory:latest \
+    install-mcp --client claude-code --apply \
+        --config-file /host/.claude/settings.json \
+        --server-url "http://localhost:49374/mcp" \
+        --auth-token "$TOKEN"
 
 # 3b. Extract the bundled hook scripts to your home dir
 docker cp ai-memory:/usr/local/share/ai-memory/hooks ~/.ai-memory/
 
-# 3c. Render the settings.json snippet, then merge the printed JSON
-#     into ~/.claude/settings.json (chmod 600 the file)
-docker run --rm akitaonrails/ai-memory:latest \
-    install-hooks --agent claude-code \
-        --hooks-dir ~/.ai-memory/hooks \
+# 3c. Wire the hooks into ~/.claude/settings.json (also auto-edits)
+docker run --rm -v "$HOME:/host" akitaonrails/ai-memory:latest \
+    install-hooks --agent claude-code --apply \
+        --hooks-dir /host/.ai-memory/hooks \
+        --config-file /host/.claude/settings.json \
         --server-url "http://localhost:49374" \
         --auth-token "$TOKEN"
 ```
+
+Both `install-mcp` and `install-hooks` accept `--apply` to **mutate
+the agent's config file in place** (idempotent — re-runs replace
+ai-memory's entry, preserving every other server / hook the user has
+configured; a timestamped `.bak-<ts>` is written next to the file
+before each modifying write). Drop `--apply` to keep the legacy
+print-the-JSON behaviour.
 
 That's it. Start a Claude Code session as usual — every prompt and
 tool call now lands in ai-memory, and the next session you open in
@@ -178,23 +188,20 @@ the whole UX. You copy what's useful, ignore what isn't.
 
 Lifecycle hooks handle *capture* and *handoff resume* without you
 typing anything. Proactive *querying* still depends on the agent
-thinking to call `memory_query`. The tool descriptions nudge in that
-direction; for projects where memory matters, drop this in your
-`CLAUDE.md` / agent system prompt:
+thinking to call `memory_query`. For projects where memory matters,
+one command installs the recommended snippet into your `CLAUDE.md`:
 
-```markdown
-## Long-term memory
-
-This project uses ai-memory. The SessionStart hook auto-fetches any
-pending handoff. Beyond that, proactively use:
-
-- `memory_query` — before proposing architecture, when the user
-  references prior work you don't recognise, or when investigating a
-  bug that might have a known root cause.
-- `memory_recent` — at session start to scan the last few pages.
-- `memory_handoff_begin` — optional; only if you want extra context
-  beyond what the SessionEnd hook captures by default.
+```bash
+docker run --rm -v "$PWD:/host" akitaonrails/ai-memory:latest \
+    install-instructions --target /host/CLAUDE.md
 ```
+
+The block is wrapped in `<!-- ai-memory:start -->` /
+`<!-- ai-memory:end -->` markers so re-running picks up an updated
+snippet without duplicating. Use `--target /host/AGENTS.md` for
+non-Claude agents, or any other path for project-rules files
+(`.cursor/rules`, `.windsurfrules`, etc.). Append `--print` to
+preview without writing.
 
 ## LLM provider — recommended defaults
 

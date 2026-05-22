@@ -15,10 +15,13 @@
 //! author's stated position), we print an explanation + pointers
 //! instead of fabricating a config.
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient};
+use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::render_shared::bearer_header_value as bearer_header_value_shared;
 use crate::config::Config;
 
@@ -28,6 +31,15 @@ use crate::config::Config;
 /// Returns an error if JSON serialisation fails (should never happen
 /// for our handcrafted values).
 pub fn run(_config: &Config, args: InstallMcpArgs) -> Result<()> {
+    if args.apply {
+        if matches!(args.client, McpClient::Pi) {
+            bail!(
+                "--apply is not supported for `pi` — pi has no MCP config to mutate. \
+                 Run without --apply to print the non-support explanation."
+            );
+        }
+        return apply_to_config_file(&args);
+    }
     let snippet = match args.client {
         McpClient::ClaudeCode => render_claude_code(&args)?,
         McpClient::Codex => render_codex(&args),
@@ -40,6 +52,193 @@ pub fn run(_config: &Config, args: InstallMcpArgs) -> Result<()> {
     };
     println!("{snippet}");
     Ok(())
+}
+
+/// Resolve the user-config file for this client. Honours
+/// `--config-file` when provided, else uses the canonical default
+/// per client.
+fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.config_file {
+        return Ok(p.clone());
+    }
+    let home = dirs::home_dir().context("could not locate $HOME for config-file auto-detect")?;
+    Ok(match args.client {
+        McpClient::ClaudeCode => home.join(".claude").join("settings.json"),
+        McpClient::Codex => home.join(".codex").join("config.toml"),
+        McpClient::OpenCode => home.join(".config").join("opencode").join("opencode.json"),
+        McpClient::Cursor => home.join(".cursor").join("mcp.json"),
+        McpClient::ClaudeDesktop => {
+            #[cfg(target_os = "macos")]
+            {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Claude")
+                    .join("claude_desktop_config.json")
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // %APPDATA% is roughly ~/AppData/Roaming.
+                home.join("AppData")
+                    .join("Roaming")
+                    .join("Claude")
+                    .join("claude_desktop_config.json")
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                bail!(
+                    "Claude Desktop is not officially distributed for this OS. \
+                     Pass --config-file explicitly if you know where it lives."
+                );
+            }
+        }
+        McpClient::GeminiCli => home.join(".gemini").join("settings.json"),
+        McpClient::Openclaw => home.join(".openclaw").join("config.json"),
+        McpClient::Pi => bail!("pi has no MCP config file (MCP not supported)"),
+    })
+}
+
+/// Mutate the resolved client config file in place. Idempotent —
+/// re-runs that produce the same content are reported as no-op.
+fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
+    let path = resolve_config_file(args)?;
+    let outcome = match args.client {
+        McpClient::ClaudeCode
+        | McpClient::ClaudeDesktop
+        | McpClient::Cursor
+        | McpClient::GeminiCli => apply_atomic(&path, |existing| {
+            mutate_json(existing, |root| {
+                let entry = build_mcp_entry(args)?;
+                let servers = root
+                    .entry("mcpServers")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .context("`mcpServers` is present but not an object")?;
+                servers.insert(args.name.clone(), entry);
+                Ok(())
+            })
+        })?,
+        McpClient::OpenCode => apply_atomic(&path, |existing| {
+            mutate_json(existing, |root| {
+                let entry = build_mcp_entry_opencode(args)?;
+                let mcp = root
+                    .entry("mcp")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .context("`mcp` is present but not an object")?;
+                mcp.insert(args.name.clone(), entry);
+                Ok(())
+            })
+        })?,
+        McpClient::Openclaw => apply_atomic(&path, |existing| {
+            mutate_json(existing, |root| {
+                let entry = build_mcp_entry_openclaw(args)?;
+                let mcp = root
+                    .entry("mcp")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .context("`mcp` is present but not an object")?;
+                let servers = mcp
+                    .entry("servers")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .context("`mcp.servers` is present but not an object")?;
+                servers.insert(args.name.clone(), entry);
+                Ok(())
+            })
+        })?,
+        McpClient::Codex => apply_atomic(&path, |existing| {
+            mutate_toml(existing, |doc| {
+                // `[mcp_servers.<name>]` table.
+                let bearer = bearer_header_value_shared(args.auth_token.as_deref());
+                let key = format!("mcp_servers.{}", args.name);
+                let _ = key; // (used in the comment above; toml_edit indexes via [] chain)
+                doc["mcp_servers"][&args.name]["url"] = toml_edit::value(args.server_url.clone());
+                if let Some(b) = bearer {
+                    doc["mcp_servers"][&args.name]["headers"]["Authorization"] =
+                        toml_edit::value(b);
+                }
+                Ok(())
+            })
+        })?,
+        McpClient::Pi => unreachable!("pi guarded above"),
+    };
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+/// JSON entry shape used by Claude Code, Claude Desktop, Cursor, and
+/// Gemini CLI — they all accept `mcpServers.<name>` with `url` or
+/// `httpUrl` plus optional `headers`. Returns the per-client variant.
+fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value_shared(args.auth_token.as_deref());
+    let mut entry = serde_json::Map::new();
+    match args.client {
+        McpClient::ClaudeCode => {
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(args.server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::ClaudeDesktop => {
+            // Stdio shim via mcp-remote — Claude Desktop's JSON
+            // doesn't accept HTTP transport directly.
+            let mut cmd_args = vec![json!("-y"), json!("mcp-remote"), json!(args.server_url)];
+            if let Some(b) = &bearer {
+                cmd_args.push(json!("--header"));
+                cmd_args.push(json!(format!("Authorization: {b}")));
+            }
+            entry.insert("command".into(), json!("npx"));
+            entry.insert("args".into(), serde_json::Value::Array(cmd_args));
+        }
+        McpClient::Cursor => {
+            entry.insert("url".into(), json!(args.server_url));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::GeminiCli => {
+            entry.insert("httpUrl".into(), json!(args.server_url));
+            entry.insert("timeout".into(), json!(5000));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        _ => bail!("internal: build_mcp_entry called for unsupported client"),
+    }
+    Ok(serde_json::Value::Object(entry))
+}
+
+fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value_shared(args.auth_token.as_deref());
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("remote"));
+    entry.insert("url".into(), json!(args.server_url));
+    entry.insert("enabled".into(), json!(true));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(serde_json::Value::Object(entry))
+}
+
+fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value_shared(args.auth_token.as_deref());
+    let mut entry = serde_json::Map::new();
+    entry.insert("url".into(), json!(args.server_url));
+    entry.insert("transport".into(), json!("streamable-http"));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(serde_json::Value::Object(entry))
 }
 
 /// Thin shim so the renderers can call `bearer_header_value(args)`
@@ -251,6 +450,8 @@ mod tests {
             server_url: "http://127.0.0.1:49374/mcp".into(),
             name: "ai-memory".into(),
             auth_token: None,
+            apply: false,
+            config_file: None,
         }
     }
 
@@ -260,6 +461,8 @@ mod tests {
             server_url: "http://127.0.0.1:49374/mcp".into(),
             name: "ai-memory".into(),
             auth_token: Some("test-token-deadbeef".into()),
+            apply: false,
+            config_file: None,
         }
     }
 
