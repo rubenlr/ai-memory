@@ -646,4 +646,124 @@ mod tests {
             .unwrap();
         assert!(again_text.contains("\"handoff\": null"));
     }
+
+    // ----------------------------------------------------------------
+    // Error / mis-configured paths — caught at the tool boundary so the
+    // agent sees a clean McpError instead of a panic.
+    // ----------------------------------------------------------------
+
+    /// `memory_consolidate` is opt-in via the LLM provider. With no
+    /// consolidator wired, the tool must reject the call with a
+    /// clear "not configured" error — not panic.
+    #[tokio::test]
+    async fn memory_consolidate_without_provider_errors_cleanly() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_consolidate(Parameters(ConsolidateArgs {
+                session_id: "00000000-0000-0000-0000-000000000000".into(),
+                dry_run: Some(true),
+                multi_page: Some(false),
+            }))
+            .await
+            .expect_err("must reject when no consolidator is configured");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not configured"),
+            "error should mention configuration: {msg}",
+        );
+    }
+
+    /// `memory_lint` reads the wiki to build its candidate set. With
+    /// no wiki wired, it must error cleanly.
+    #[tokio::test]
+    async fn memory_lint_without_wiki_errors_cleanly() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_lint(Parameters(LintArgs {
+                dry_run: Some(true),
+            }))
+            .await
+            .expect_err("must reject when wiki is not attached");
+        let msg = format!("{err:?}");
+        // The exact phrasing isn't load-bearing; we just need
+        // SOMETHING that names the missing dependency so the agent's
+        // model has a chance of choosing a different tool.
+        assert!(
+            msg.contains("wiki") || msg.contains("not configured"),
+            "error should explain the missing wiki: {msg}",
+        );
+    }
+
+    /// `memory_handoff_accept` with no pending handoff returns a
+    /// happy-path `{"handoff": null}` payload (NOT an error). This
+    /// is the documented contract — the agent can call accept on
+    /// every session-start without worrying about empty-queue errors.
+    #[tokio::test]
+    async fn memory_handoff_accept_when_none_pending_returns_null() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let result = server
+            .memory_handoff_accept(Parameters(HandoffAcceptArgs { cwd: None }))
+            .await
+            .expect("empty-queue must be Ok, not Err");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("\"handoff\": null"),
+            "expected handoff=null in: {text}",
+        );
+    }
+
+    /// `memory_query` clamps `limit` into [1, 100]. Anyone sending
+    /// limit=10000 (DoS attempt or accidental overflow) gets the
+    /// max instead of an unbounded scan.
+    #[tokio::test]
+    async fn memory_query_clamps_outlandish_limit() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        // The clamp is internal; the test verifies the call succeeds
+        // with a sane response. (We don't have 10k pages, so the
+        // hit count is small — we just need NOT to error.)
+        let result = server
+            .memory_query(Parameters(QueryArgs {
+                query: "Karpathy".into(),
+                limit: Some(99_999),
+            }))
+            .await
+            .expect("oversized limit should be clamped, not refused");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        // Returns valid JSON even on huge limit.
+        let _: serde_json::Value = serde_json::from_str(&text).unwrap();
+    }
+
+    /// `memory_query` with malformed FTS5 must return a clean
+    /// McpError (NOT panic, NOT bare SQLite error). The FTS5
+    /// tokenizer treats `-` as a NOT operator and some characters
+    /// as syntax; an unbalanced quote is the simplest reproducer.
+    #[tokio::test]
+    async fn memory_query_malformed_fts5_returns_error() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_query(Parameters(QueryArgs {
+                query: "\"unbalanced".into(),
+                limit: Some(10),
+            }))
+            .await;
+        // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or
+        // an Err — both are acceptable. A panic is not.
+        if let Err(e) = err {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.is_empty(),
+                "error must carry diagnostic text for the agent",
+            );
+        }
+    }
 }

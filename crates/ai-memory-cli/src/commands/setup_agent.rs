@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, SetupAgentArgs};
-use crate::commands::install_hooks::{CLAUDE_CODE_EVENTS, build_claude_code_payload};
+use crate::commands::render_shared::{CLAUDE_CODE_EVENTS, build_claude_code_payload};
 use crate::config::Config;
 
 /// Run the `setup-agent` subcommand.

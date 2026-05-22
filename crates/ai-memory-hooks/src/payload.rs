@@ -229,4 +229,120 @@ mod tests {
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
     }
+
+    /// Alternative agent-name spellings all map to the same canonical
+    /// AgentKind. The hook scripts and the test e2e shim send slightly
+    /// different strings for historical reasons; this asserts we
+    /// remain forgiving.
+    #[test]
+    fn agent_name_aliases_all_map_correctly() {
+        assert_eq!(parse_agent("claude-code"), AgentKind::ClaudeCode);
+        assert_eq!(parse_agent("claude_code"), AgentKind::ClaudeCode);
+        assert_eq!(parse_agent("claude"), AgentKind::ClaudeCode);
+        assert_eq!(parse_agent("codex"), AgentKind::Codex);
+        assert_eq!(parse_agent("opencode"), AgentKind::OpenCode);
+        assert_eq!(parse_agent("open-code"), AgentKind::OpenCode);
+        // Anything else is `Other`. Critical for the hook router:
+        // a typo in the query string must not crash, it just gets
+        // attributed to the catch-all bucket.
+        assert_eq!(parse_agent(""), AgentKind::Other);
+        assert_eq!(parse_agent("CLAUDE-CODE"), AgentKind::Other); // case-sensitive on purpose
+        assert_eq!(parse_agent("gemini-cli"), AgentKind::Other);
+        assert_eq!(parse_agent("../../etc/passwd"), AgentKind::Other);
+    }
+
+    /// An empty body is legitimate (some hook events carry no
+    /// payload). Envelope extraction must produce sane defaults
+    /// rather than panicking.
+    #[test]
+    fn envelope_tolerates_empty_body() {
+        let q = HookQuery {
+            event: "stop".into(),
+            agent: Some("claude-code".into()),
+        };
+        let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
+        assert_eq!(env.event, HookEvent::Stop);
+        assert!(env.session_id.is_none());
+        assert!(env.cwd.is_none());
+        assert!(env.title_hint.is_none());
+        assert!(env.body_excerpt.is_none());
+    }
+
+    /// Body is well-formed JSON but the expected `session_id` /
+    /// `cwd` keys are missing — extraction returns None per key.
+    #[test]
+    fn envelope_missing_expected_fields() {
+        let q = HookQuery {
+            event: "user-prompt".into(),
+            agent: Some("claude-code".into()),
+        };
+        let raw = serde_json::json!({ "garbage": 42 });
+        let env = HookEnvelope::from_query_and_body(q, raw);
+        assert_eq!(env.event, HookEvent::UserPrompt);
+        assert!(env.session_id.is_none());
+        assert!(env.cwd.is_none());
+    }
+
+    /// Body is a JSON primitive (string / null / number) rather
+    /// than an object. The extractors must short-circuit cleanly.
+    /// This guards against an upstream that POSTs a stringified
+    /// payload by mistake.
+    #[test]
+    fn envelope_accepts_non_object_body() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+        };
+        for raw in [
+            serde_json::json!(null),
+            serde_json::json!("a stringy payload"),
+            serde_json::json!(42),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            let env = HookEnvelope::from_query_and_body(q.clone(), raw);
+            assert!(
+                env.session_id.is_none(),
+                "no session_id from non-object body"
+            );
+            assert!(env.cwd.is_none(), "no cwd from non-object body");
+        }
+    }
+
+    /// Empty `agent` query param maps to Other (rather than panic
+    /// or default to ClaudeCode). The hook router uses this for the
+    /// attribution column, so we want it consistent.
+    #[test]
+    fn missing_agent_query_param_maps_to_other() {
+        let q = HookQuery {
+            event: "session-end".into(),
+            agent: None,
+        };
+        let env = HookEnvelope::from_query_and_body(q, serde_json::json!({}));
+        assert_eq!(env.agent, AgentKind::Other);
+    }
+
+    /// Title-hint extraction must truncate at the first newline (the
+    /// "first line" rule used everywhere in the wiki log + handoff
+    /// surfaces) and cap at 80 chars to keep observation titles
+    /// scannable in the log.md heading.
+    #[test]
+    fn user_prompt_title_truncates_at_newline_and_at_max_chars() {
+        let q = HookQuery {
+            event: "user-prompt".into(),
+            agent: Some("claude-code".into()),
+        };
+        // Multi-line prompt → title is the first line only.
+        let env = HookEnvelope::from_query_and_body(
+            q.clone(),
+            serde_json::json!({ "prompt": "first line\nsecond line should be lost" }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("first line"));
+
+        // Very long single line → truncated with ellipsis.
+        let long = "x".repeat(200);
+        let env = HookEnvelope::from_query_and_body(q, serde_json::json!({ "prompt": long }));
+        let title = env.title_hint.unwrap();
+        assert!(title.chars().count() <= 80);
+        assert!(title.ends_with('…'));
+    }
 }

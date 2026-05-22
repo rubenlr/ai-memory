@@ -10,6 +10,7 @@ pub mod install_hooks;
 pub mod install_mcp;
 pub mod lint;
 pub mod llm_test;
+pub mod render_shared;
 pub mod reset;
 pub mod restore;
 pub mod search;

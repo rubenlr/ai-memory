@@ -19,6 +19,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient};
+use crate::commands::render_shared::bearer_header_value as bearer_header_value_shared;
 use crate::config::Config;
 
 /// Run the `install-mcp` subcommand.
@@ -41,11 +42,12 @@ pub fn run(_config: &Config, args: InstallMcpArgs) -> Result<()> {
     Ok(())
 }
 
-/// Render an `Authorization: Bearer <token>` header value if a token
-/// is set; returns `None` otherwise. Centralised so every renderer
-/// makes the same choice.
+/// Thin shim so the renderers can call `bearer_header_value(args)`
+/// without spelling out `args.auth_token.as_deref()` every time.
+/// Delegates to the shared `render_shared::bearer_header_value` which
+/// takes a raw `Option<&str>` so other commands can call it too.
 fn bearer_header_value(args: &InstallMcpArgs) -> Option<String> {
-    args.auth_token.as_deref().map(|t| format!("Bearer {t}"))
+    bearer_header_value_shared(args.auth_token.as_deref())
 }
 
 fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
