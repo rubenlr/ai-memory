@@ -94,6 +94,27 @@ blocking issue:**
 12. No global singletons / `lazy_static` configs.
 13. Zero-LLM default path. LLM features opt-in via env.
 14. Tracing subscribers explicitly filter their own module.
+15. **Every command + storage operation is namespaced by the current
+    sub-dir as the project id.** The router derives the project from
+    `basename(cwd)`; bootstrap / lint / embed / forget-sweep /
+    purge-project / rename-project / consolidate ALL resolve through
+    the same helper. There is no generic `scratch` fallback in the
+    happy path — `scratch` exists only as a defensive default for
+    hook events that arrive without a `cwd` (e.g. early startup or
+    misconfigured agents). New commands/handlers that bake in a
+    `workspace_id`/`project_id` at construction time MUST look up
+    the session's actual project (via
+    `ReaderPool::session_project_ids` or equivalent) before writing.
+16. **The CLI is always a thin HTTP client to the running MCP /
+    admin server.** The server is the ground truth and the sole
+    writer of wiki + SQLite. CLI commands NEVER call `Store::open`,
+    `Wiki::new`, `build_provider`, or `build_embedder`. State
+    mutations go through `/admin/*` HTTP routes; reads go through
+    MCP tools or `/admin/*` GETs. The two exceptions are
+    `init` / `serve` / `generate-auth-token` / `install-*` /
+    `setup-agent` — local-only setup commands that don't touch
+    server state. Use the shared `crate::http_client::{ServerEndpoint,
+    get_json, post_json}` plumbing for every new client subcommand.
 
 ## Mistakes documented in the research — do NOT repeat
 

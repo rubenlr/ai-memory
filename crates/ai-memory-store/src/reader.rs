@@ -328,6 +328,39 @@ impl ReaderPool {
         .await
     }
 
+    /// Look up the `(workspace_id, project_id)` a session belongs to.
+    /// Returns `None` when no such session row exists.
+    ///
+    /// Used by the consolidator + lint pass to write pages into the
+    /// SESSION'S project, not the server's startup defaults — every
+    /// session row carries the project_id the hook router resolved
+    /// from its per-cwd basename heuristic, which is the correct
+    /// target for any wiki page derived from that session.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_project_ids(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT workspace_id, project_id FROM sessions WHERE id = ?1")?;
+            let mut rows = stmt.query(params![session_id.as_bytes()])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let ws_bytes: Vec<u8> = row.get(0)?;
+            let proj_bytes: Vec<u8> = row.get(1)?;
+            let ws = WorkspaceId::from_slice(&ws_bytes)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
+            let proj = ProjectId::from_slice(&proj_bytes)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
+            Ok(Some((ws, proj)))
+        })
+        .await
+    }
+
     /// Load every `is_latest=1` page's embedding for the project, but
     /// only when the stored `(provider, model, dim)` matches the
     /// caller's expectation. Mismatched rows are skipped (the

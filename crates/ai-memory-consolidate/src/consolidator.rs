@@ -110,6 +110,17 @@ impl Consolidator {
             return Err(ConsolidatorError::EmptySession(session_id));
         }
 
+        // Look up the session's actual (workspace, project) IDs — the
+        // hook router stamped them per-cwd at session start, so this
+        // is the correct target for the resulting wiki page. The
+        // server's startup IDs (self.workspace_id / self.project_id)
+        // are the fallback for sessions that pre-date per-cwd routing.
+        let (ws, proj) = self
+            .reader
+            .session_project_ids(session_id)
+            .await?
+            .unwrap_or((self.workspace_id, self.project_id));
+
         let path = PagePath::new(format!("sessions/{session_id}.md"))?;
         let current_body = self
             .wiki
@@ -140,8 +151,8 @@ impl Consolidator {
         let id = self
             .wiki
             .write_page(WritePageRequest {
-                workspace_id: self.workspace_id,
-                project_id: self.project_id,
+                workspace_id: ws,
+                project_id: proj,
                 path: path.clone(),
                 frontmatter,
                 body: page.body_markdown.clone(),
@@ -209,6 +220,13 @@ impl Consolidator {
         if observations.is_empty() {
             return Err(ConsolidatorError::EmptySession(session_id));
         }
+        // Resolve the session's actual (workspace, project) IDs from
+        // its row — see `consolidate_session` for the rationale.
+        let (ws, proj) = self
+            .reader
+            .session_project_ids(session_id)
+            .await?
+            .unwrap_or((self.workspace_id, self.project_id));
         let request = build_batch_request(session_id, &observations);
         debug!(
             session = %session_id,
@@ -261,8 +279,8 @@ impl Consolidator {
             }
             fm.insert("consolidated".into(), serde_json::Value::Bool(true));
             requests.push(WritePageRequest {
-                workspace_id: self.workspace_id,
-                project_id: self.project_id,
+                workspace_id: ws,
+                project_id: proj,
                 path: path.clone(),
                 frontmatter: serde_json::Value::Object(fm),
                 body: upd.body_markdown.clone(),
