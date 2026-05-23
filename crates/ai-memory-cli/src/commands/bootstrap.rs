@@ -32,24 +32,53 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
     let ep = ServerEndpoint::from_env();
     info!(server = %ep.url, auth = ep.auth_token.is_some(), "bootstrap CLI configured");
 
-    // ---- repo path — auto-detect via libgit2 if absent ------------
-    // libgit2 walks up from CWD looking for `.git`, so the slim
-    // runtime container doesn't need a `git` binary.
-    let repo_path = match args.repo_path {
-        Some(p) => p,
-        None => discover_repo_root(std::path::Path::new("."))
-            .context("auto-detecting --repo-path (no .git found at or above CWD)")?,
+    // ---- repo path — auto-detect via libgit2, fall back to CWD ----
+    // Try libgit2's `Repository::discover` (walks up looking for
+    // `.git`). If the user passed `--repo-path` explicitly, use it
+    // unchanged. If the auto-detect finds a git repo, use its root.
+    // If neither, fall back to the current working directory and
+    // silently disable git-history collection — README, docs/ and
+    // project-rules files are still useful seeds even without a
+    // git history.
+    let (repo_path, has_git) = match args.repo_path {
+        Some(p) => {
+            let has_git = p.join(".git").exists();
+            (p, has_git)
+        }
+        None => match discover_repo_root(std::path::Path::new(".")) {
+            Ok(root) => (root, true),
+            Err(_) => {
+                let cwd = std::env::current_dir()
+                    .context("getting CWD for bootstrap (no git repo, falling back to .)")?;
+                info!(
+                    cwd = %cwd.display(),
+                    "no .git found at or above CWD; bootstrapping from non-git sources only"
+                );
+                (cwd, false)
+            }
+        },
     };
+    // When there's no git repo, force-disable git-commit collection
+    // regardless of the user's --exclude-git flag. `collect_sources`
+    // would otherwise try to open the repo and fail.
+    let include_git = !args.exclude_git && has_git;
+    if !has_git && !args.exclude_git {
+        eprintln!(
+            "note: no .git found at {}; bootstrapping from README/docs/rules only \
+             (git-commit history skipped). Pass --repo-path or `git init` to include commits.",
+            repo_path.display()
+        );
+    }
 
     // ---- project — auto-derive from repo basename if absent -------
     let project = super::resolve_project_name(args.project.as_deref())?;
-    info!(workspace = %args.workspace, project = %project, repo_path = %repo_path.display(), "bootstrap target");
+    info!(workspace = %args.workspace, project = %project, repo_path = %repo_path.display(), git = has_git, "bootstrap target");
 
     // ---- collect sources locally ----------------------------------
     let sources = collect_sources(
         &repo_path,
         args.since.as_deref(),
-        !args.exclude_git,
+        include_git,
         !args.exclude_readme,
         !args.exclude_docs,
         !args.exclude_code,
