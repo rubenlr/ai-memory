@@ -1,6 +1,6 @@
 //! Subcommand implementations.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub mod apply_shared;
 pub mod backup;
@@ -60,6 +60,29 @@ pub(crate) fn resolve_project_name(explicit: Option<&str>) -> Result<String> {
     {
         return Ok(name.to_string());
     }
+
+    // Safety net: when running inside the docker wrapper, the
+    // container's workdir is bind-mounted at `/work` (a fresh path
+    // chosen specifically because the host's `$PWD` would conflict
+    // with the $HOME bind mount). If we fall through to here while
+    // `current_dir()` is `/work`, the wrapper is STALE: it didn't
+    // pass `-e AI_MEMORY_HOST_CWD=$PWD` and the binary has no idea
+    // which host dir invoked it. Bail with a clear remedy instead
+    // of silently writing every project to `default/work`.
+    let cwd = std::env::current_dir().context("getting CWD for project auto-detect")?;
+    if cwd.as_os_str() == "/work" {
+        bail!(
+            "the `ai-memory` wrapper at ~/.local/bin/ai-memory looks stale \
+             (it didn't pass AI_MEMORY_HOST_CWD into the container). Without \
+             this, every project would land in `default/work` regardless of \
+             which host dir you ran from. Fix:\n  \
+             curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \\\n    \
+               -o ~/.local/bin/ai-memory && chmod +x ~/.local/bin/ai-memory\n  \
+             (or run `ai-memory upgrade` if your existing wrapper is recent enough \
+             to know that command)"
+        );
+    }
+
     if let Ok(root) = ai_memory_consolidate::discover_repo_root(std::path::Path::new("."))
         && let Some(name) = root
             .file_name()
@@ -68,7 +91,6 @@ pub(crate) fn resolve_project_name(explicit: Option<&str>) -> Result<String> {
     {
         return Ok(name.to_string());
     }
-    let cwd = std::env::current_dir().context("getting CWD for project auto-detect")?;
     cwd.file_name()
         .and_then(|s| s.to_str())
         .map(str::to_string)
