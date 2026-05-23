@@ -35,11 +35,19 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 use tracing::debug;
+
+/// Cookie name used by the browser-friendly `?_token=` flow.
+const AUTH_COOKIE: &str = "ai_memory_auth";
+/// Query-param the browser flow accepts ONCE — middleware verifies
+/// the value, sets the cookie, then redirects to the same URL with
+/// `_token` stripped so the secret doesn't linger in history /
+/// bookmarks / referer headers.
+const AUTH_QUERY_PARAM: &str = "_token";
 
 /// Shared auth state. Cheap to clone — just an `Arc` wrapping the
 /// optional configured token.
@@ -67,6 +75,24 @@ impl AuthState {
 
 /// axum middleware closure. Wire with
 /// `axum::middleware::from_fn_with_state(state, require_bearer)`.
+///
+/// Token sources, in priority order:
+/// 1. `Authorization: Bearer <token>` header. Works for any method.
+///    This is what the MCP + hook clients send.
+/// 2. **GET only:** `ai_memory_auth` cookie. Set automatically by
+///    the redirect path below; persists across navigation so the
+///    browser doesn't need a header-rewriting extension.
+/// 3. **GET only:** `?_token=<token>` query parameter. On match the
+///    middleware sets the cookie + 303-redirects to the same URL
+///    with `_token` stripped, so the secret doesn't get bookmarked,
+///    logged in referer headers, or sit in browser history.
+///
+/// POST / PUT / DELETE / etc. require the header — that confines
+/// cookie-bearing requests to read-only operations and keeps the
+/// CSRF surface of cookie auth small (a malicious page on another
+/// origin can ride the cookie into GETs, but `/mcp` and `/hook` are
+/// POST-only, so the worst it can do is render /web pages the user
+/// could already see).
 pub async fn require_bearer(
     State(state): State<Arc<AuthState>>,
     req: Request<axum::body::Body>,
@@ -76,28 +102,106 @@ pub async fn require_bearer(
         return next.run(req).await;
     };
 
-    let provided = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| {
-            // Accept both "Bearer xxx" and "bearer xxx" (case-insensitive
-            // scheme per RFC 7235 §2.1).
-            let (scheme, value) = h.split_once(' ')?;
-            if scheme.eq_ignore_ascii_case("Bearer") {
-                Some(value.trim_start())
-            } else {
-                None
-            }
-        })
+    let from_header = extract_bearer_header(&req);
+    let is_get = req.method() == Method::GET;
+    let from_cookie = if is_get { extract_cookie(&req) } else { None };
+    let from_query = if is_get {
+        extract_query_token(&req)
+    } else {
+        None
+    };
+
+    let provided = from_header
+        .as_deref()
+        .or(from_cookie.as_deref())
+        .or(from_query.as_deref())
         .unwrap_or("");
 
-    if provided.as_bytes().ct_eq(expected.as_bytes()).into() {
-        next.run(req).await
-    } else {
+    if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
         debug!("auth rejected: invalid or missing bearer token");
-        unauthorized()
+        return unauthorized();
     }
+
+    // Browser-friendly handoff: when the token arrived ONLY via the
+    // query string, swap it for a cookie + redirect. Subsequent
+    // navigation (and inlined assets like /static/tailwind.css) ride
+    // the cookie, so the token never appears in the visible URL bar
+    // after the first hop.
+    if from_header.is_none() && from_cookie.is_none() && from_query.is_some() {
+        return redirect_with_cookie(&req, provided);
+    }
+
+    next.run(req).await
+}
+
+fn extract_bearer_header(req: &Request<axum::body::Body>) -> Option<String> {
+    let h = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    // Accept both "Bearer xxx" and "bearer xxx" (case-insensitive
+    // scheme per RFC 7235 §2.1).
+    let (scheme, value) = h.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Bearer") {
+        Some(value.trim_start().to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_cookie(req: &Request<axum::body::Body>) -> Option<String> {
+    let h = req.headers().get(header::COOKIE)?.to_str().ok()?;
+    for pair in h.split(';') {
+        let pair = pair.trim();
+        if let Some(val) = pair.strip_prefix(&format!("{AUTH_COOKIE}=")) {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+fn extract_query_token(req: &Request<axum::body::Body>) -> Option<String> {
+    let q = req.uri().query()?;
+    for pair in q.split('&') {
+        if let Some(val) = pair.strip_prefix(&format!("{AUTH_QUERY_PARAM}=")) {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+fn redirect_with_cookie(req: &Request<axum::body::Body>, token: &str) -> Response {
+    let path = req.uri().path();
+    let cleaned_query: String = req
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.starts_with(&format!("{AUTH_QUERY_PARAM}=")) && !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("&");
+    let target = if cleaned_query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{cleaned_query}")
+    };
+    // 30-day Max-Age — long enough that re-typing the bookmark URL
+    // every month is rare. HttpOnly hides it from any inline JS;
+    // SameSite=Lax keeps cross-site POSTs from riding it.
+    // We deliberately don't set Secure: homelab deployments are
+    // often plain HTTP on a LAN. A reverse proxy that terminates
+    // TLS upstream is the right place to add Secure if exposed
+    // publicly.
+    let cookie = format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
+    let mut resp = (StatusCode::SEE_OTHER, "").into_response();
+    resp.headers_mut().insert(
+        header::LOCATION,
+        target.parse().expect("target path is a valid header value"),
+    );
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        cookie
+            .parse()
+            .expect("cookie value is a valid header value"),
+    );
+    resp
 }
 
 fn unauthorized() -> Response {
@@ -241,6 +345,131 @@ mod tests {
                 Request::builder()
                     .uri("/probe")
                     .header("Authorization", "Basic dXNlcjpwYXNz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cookie_with_right_token_passes_get() {
+        let r = router_with_auth(Some("right-token"));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Cookie", "ai_memory_auth=right-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cookie_with_wrong_token_fails() {
+        let r = router_with_auth(Some("right-token"));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Cookie", "ai_memory_auth=wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cookie_ignored_on_post() {
+        // POST routes must use Bearer header; cookie auth is GET-only
+        // to keep the CSRF surface confined to read paths.
+        let state = Arc::new(AuthState::new(Some("right-token".to_string())));
+        let r = Router::new()
+            .route("/probe", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .header("Cookie", "ai_memory_auth=right-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn query_token_redirects_and_sets_cookie() {
+        let r = router_with_auth(Some("right-token"));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe?_token=right-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("redirect target")
+            .to_str()
+            .unwrap();
+        assert_eq!(loc, "/probe");
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("set-cookie")
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("ai_memory_auth=right-token"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Path=/"));
+    }
+
+    #[tokio::test]
+    async fn query_token_preserves_other_params() {
+        let r = router_with_auth(Some("right-token"));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe?foo=bar&_token=right-token&baz=qux")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // _token stripped; foo + baz preserved (order doesn't matter
+        // but we filter sequentially so order is stable).
+        assert_eq!(loc, "/probe?foo=bar&baz=qux");
+    }
+
+    #[tokio::test]
+    async fn query_token_wrong_value_returns_401() {
+        let r = router_with_auth(Some("right-token"));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe?_token=wrong-token")
                     .body(Body::empty())
                     .unwrap(),
             )
