@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::{AgentChoice, InstallHooksArgs};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json};
-use crate::commands::render_shared::build_claude_code_payload;
+use crate::commands::render_shared::{build_claude_code_payload, build_codex_payload};
 use crate::config::Config;
 
 /// Run the `install-hooks` subcommand.
@@ -24,14 +24,18 @@ pub fn run(_config: &Config, args: InstallHooksArgs) -> Result<()> {
     let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
     let auth = args.auth_token.as_deref();
     if args.apply {
-        if !matches!(args.agent, AgentChoice::ClaudeCode) {
-            bail!(
-                "--apply currently only supports --agent claude-code. Codex / OpenCode \
-                 hook config formats are still evolving upstream; print the snippet \
-                 (drop --apply) and merge by hand."
-            );
-        }
-        return apply_to_claude_code_settings(&hooks_dir, &args.server_url, auth, &args);
+        return match args.agent {
+            AgentChoice::ClaudeCode => {
+                apply_to_claude_code_settings(&hooks_dir, &args.server_url, auth, &args)
+            }
+            AgentChoice::Codex => {
+                apply_to_codex_settings(&hooks_dir, &args.server_url, auth, &args)
+            }
+            AgentChoice::OpenCode => bail!(
+                "--apply does not yet support --agent open-code (no stable upstream \
+                 hook schema documented). Run without --apply to print the snippet."
+            ),
+        };
     }
     match args.agent {
         AgentChoice::ClaudeCode => render_claude_code(&hooks_dir, &args.server_url, auth),
@@ -89,6 +93,94 @@ fn apply_to_claude_code_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    Ok(())
+}
+
+/// Mutate `~/.codex/hooks.json` (creating it if absent) so Codex's
+/// lifecycle hook runner fires the ai-memory scripts on every
+/// session/prompt/tool event.
+///
+/// Codex's hook config is structurally identical to Claude Code's
+/// (verified against `openai/codex/codex-rs/config/src/hooks_tests.rs`):
+///
+///   { "hooks": {
+///       "SessionStart": [
+///         { "matcher": "",
+///           "hooks": [ {"type":"command", "command":"..."} ]
+///         }
+///       ], ...
+///   } }
+///
+/// Codex looks for hooks in `~/.codex/hooks.json` by default (or
+/// wherever `hooks = "./relative-path.json"` in config.toml points).
+/// We write the standalone file and don't touch config.toml — Codex
+/// picks it up automatically.
+///
+/// Trust note: Codex refuses to RUN new hooks until the user accepts
+/// them in the TUI ("Trust all and continue") or sets
+/// `--dangerously-bypass-hook-trust`. We print a reminder.
+fn apply_to_codex_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => dirs::home_dir()
+            .context("could not locate $HOME for ~/.codex/hooks.json")?
+            .join(".codex")
+            .join("hooks.json"),
+    };
+    // Build the Codex-flavoured payload. The JSON shape is identical
+    // to Claude Code's matcher + nested hooks form — only the event
+    // list differs (no `SessionEnd`, which Codex doesn't recognise).
+    let payload = build_codex_payload(hooks_dir, server_url, auth_token);
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .context("internal: payload builder didn't return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in hooks.json but not an object")?;
+            // Remove any stale `SessionEnd` entry left behind by an
+            // earlier version of install-hooks that mistakenly wrote
+            // the Claude-Code-only event into Codex's file. Codex
+            // ignores unknown events but the file looks cleaner
+            // without dead keys.
+            hooks.remove("SessionEnd");
+            for (event, value) in &our_hooks {
+                hooks.insert(event.clone(), value.clone());
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    // First-time trust reminder. Codex's TUI flags new/changed
+    // hooks on startup; users must explicitly trust them before
+    // they fire.
+    if !matches!(outcome, ApplyOutcome::NoOp) {
+        println!();
+        println!("Codex requires explicit trust for new hooks. Next time you start `codex`:");
+        println!("  → the TUI will surface 'Hooks need review' for each new event");
+        println!("  → choose 'Trust all and continue' (or trust individually)");
+        println!("To bypass the prompt for automated installs, start with");
+        println!("`codex --dangerously-bypass-hook-trust` (review hook scripts first).");
+    }
     Ok(())
 }
 

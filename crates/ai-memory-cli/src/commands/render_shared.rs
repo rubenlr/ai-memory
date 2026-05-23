@@ -74,8 +74,44 @@ pub(crate) fn build_claude_code_payload(
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
+    build_hook_payload(&CLAUDE_CODE_EVENTS, emit_root, server_url, auth_token)
+}
+
+/// Codex's hook-event vocabulary (per the openai/codex source —
+/// see `codex-rs/config/src/hooks_tests.rs`). Same shape as Claude
+/// Code's seven events, EXCEPT: Codex has no `SessionEnd` (it uses
+/// `Stop` for both turn-end and session-end signalling). The other
+/// six events line up 1:1.
+pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+];
+
+/// Build a Codex-flavoured hook payload. Same JSON shape as Claude
+/// Code's (verified against `openai/codex/codex-rs/config/src/hooks_tests.rs`)
+/// minus `SessionEnd`, which Codex doesn't have.
+pub(crate) fn build_codex_payload(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload(&CODEX_EVENTS, emit_root, server_url, auth_token)
+}
+
+/// Shared helper. Given a list of `(event_name, script_basename)`,
+/// emit `{ "hooks": { "EventName": [matcher+inner-hooks] } }`.
+fn build_hook_payload(
+    events: &[(&str, &str)],
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
     let mut hooks_block = serde_json::Map::new();
-    for (event, script) in CLAUDE_CODE_EVENTS {
+    for (event, script) in events {
         let abs = emit_root.join(script);
 
         // Claude Code's hook schema (per
@@ -110,7 +146,7 @@ pub(crate) fn build_claude_code_payload(
         // for ai-memory's capture hooks (every prompt, every tool
         // call, every session boundary).
         hooks_block.insert(
-            event.into(),
+            (*event).to_string(),
             json!([{
                 "matcher": "",
                 "hooks": [{
