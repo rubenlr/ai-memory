@@ -13,9 +13,14 @@ struct EmbedRequest {
     workspace: String,
     project: String,
     reembed: bool,
+    dry_run: bool,
 }
 
 /// Run the `embed` subcommand.
+///
+/// Sends the request to the server over HTTP and prints the JSON
+/// response. In dry-run mode the server counts pages that would be
+/// embedded without calling the embedder or writing anything.
 ///
 /// # Errors
 /// Returns an error if the server is unreachable or returns a non-2xx
@@ -31,9 +36,17 @@ pub async fn run(_config: &Config, args: EmbedArgs) -> Result<()> {
             // The CLI flag was historically named `force`; the server
             // field is `reembed` — map them here.
             reembed: args.force,
+            dry_run: args.dry_run,
         },
     )
     .await?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if args.dry_run {
+        let would = report["would_embed"].as_u64().unwrap_or(0);
+        let skipped = report["skipped"].as_u64().unwrap_or(0);
+        println!("dry-run: would embed {would} page(s), {skipped} already up-to-date");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
     Ok(())
 }

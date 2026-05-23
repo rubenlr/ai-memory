@@ -34,15 +34,26 @@ impl ServerEndpoint {
     /// loopback, the token defaults to unset.
     #[must_use]
     pub fn from_env() -> Self {
-        let url = std::env::var("AI_MEMORY_SERVER_URL")
-            .ok()
+        Self::from_pair(
+            std::env::var("AI_MEMORY_SERVER_URL").ok(),
+            std::env::var("AI_MEMORY_AUTH_TOKEN").ok(),
+        )
+    }
+
+    /// Build from an explicit URL + token pair (useful for tests that
+    /// cannot safely mutate the process environment).
+    ///
+    /// `url` defaults to `http://127.0.0.1:49374` when `None` or empty;
+    /// trailing slashes are stripped. `token` is treated as absent when
+    /// `None` or empty.
+    #[must_use]
+    pub(crate) fn from_pair(url: Option<String>, token: Option<String>) -> Self {
+        let url = url
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "http://127.0.0.1:49374".to_string())
             .trim_end_matches('/')
             .to_string();
-        let auth_token = std::env::var("AI_MEMORY_AUTH_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let auth_token = token.filter(|s| !s.is_empty());
         Self { url, auth_token }
     }
 
@@ -110,4 +121,87 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from POST {url}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ----------------------------------------------------------------
+    // ServerEndpoint::from_pair
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn from_pair_defaults_to_loopback_when_none() {
+        let ep = ServerEndpoint::from_pair(None, None);
+        assert_eq!(ep.url, "http://127.0.0.1:49374");
+        assert!(ep.auth_token.is_none());
+    }
+
+    #[test]
+    fn from_pair_defaults_to_loopback_when_empty() {
+        let ep = ServerEndpoint::from_pair(Some(String::new()), None);
+        assert_eq!(ep.url, "http://127.0.0.1:49374");
+    }
+
+    #[test]
+    fn from_pair_strips_trailing_slash() {
+        let ep = ServerEndpoint::from_pair(Some("http://10.0.0.1:8080/".to_string()), None);
+        assert_eq!(ep.url, "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn from_pair_strips_multiple_trailing_slashes() {
+        let ep = ServerEndpoint::from_pair(Some("http://10.0.0.1:8080///".to_string()), None);
+        assert_eq!(ep.url, "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn from_pair_empty_token_treated_as_none() {
+        let ep = ServerEndpoint::from_pair(None, Some(String::new()));
+        assert!(ep.auth_token.is_none());
+    }
+
+    #[test]
+    fn from_pair_non_empty_token_preserved() {
+        let ep = ServerEndpoint::from_pair(None, Some("secret".to_string()));
+        assert_eq!(ep.auth_token.as_deref(), Some("secret"));
+    }
+
+    // ----------------------------------------------------------------
+    // ServerEndpoint::authenticate
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn authenticate_no_token_leaves_request_unchanged() {
+        let ep = ServerEndpoint::from_pair(None, None);
+        let client = reqwest::Client::new();
+        // Build a request, authenticate it, then build to inspect.
+        let req = ep
+            .authenticate(client.get("http://localhost"))
+            .build()
+            .unwrap();
+        // No Authorization header should be present.
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "no Authorization header expected"
+        );
+    }
+
+    #[test]
+    fn authenticate_with_token_sets_bearer_header() {
+        let ep = ServerEndpoint::from_pair(None, Some("tok123".to_string()));
+        let client = reqwest::Client::new();
+        let req = ep
+            .authenticate(client.get("http://localhost"))
+            .build()
+            .unwrap();
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("Authorization header must be set")
+            .to_str()
+            .unwrap();
+        assert_eq!(auth, "Bearer tok123");
+    }
 }

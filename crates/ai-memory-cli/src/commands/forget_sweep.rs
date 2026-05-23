@@ -17,6 +17,9 @@ struct ForgetSweepRequest {
 
 /// Run the `forget-sweep` subcommand.
 ///
+/// Sends the retention-sweep request to the server over HTTP and
+/// prints the JSON response.
+///
 /// # Errors
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
@@ -26,8 +29,8 @@ pub async fn run(_config: &Config, args: ForgetSweepArgs) -> Result<()> {
         &endpoint,
         "/admin/forget-sweep",
         &ForgetSweepRequest {
-            workspace: "default".to_string(),
-            project: "scratch".to_string(),
+            workspace: args.workspace,
+            project: args.project,
             dry_run: args.dry_run,
         },
     )

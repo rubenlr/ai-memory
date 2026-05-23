@@ -227,7 +227,10 @@ pub struct BootstrapOutcome {
 /// to concrete values.
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
-    /// Project repo root. Sources are read relative to here.
+    /// Project repo root on the client's filesystem. Used by
+    /// [`Bootstrap::run`]'s client-side [`collect_sources`] call.
+    /// Ignored by [`Bootstrap::process_sources`] — sources arrive
+    /// pre-collected on the server-side path.
     pub repo_path: PathBuf,
     /// Workspace identifier the generated pages belong to.
     pub workspace_id: WorkspaceId,

@@ -179,10 +179,42 @@ async fn handle_search(
             Json(serde_json::to_value(&hits).unwrap_or_else(|_| serde_json::json!([]))),
         ),
         Err(e) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------
+
+/// Build a 500 response carrying the given message.
+fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": msg.into() })),
+    )
+}
+
+/// Resolve workspace + project IDs, creating them if absent. Returns
+/// either the IDs or a ready-to-return error response.
+async fn resolve_ws_proj(
+    state: &AdminState,
+    workspace: &str,
+    project: &str,
+) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    let ws = state
+        .writer
+        .get_or_create_workspace(workspace.to_string())
+        .await
+        .map_err(|e| internal_err(format!("workspace: {e}")))?;
+    let proj = state
+        .writer
+        .get_or_create_project(ws, project.to_string(), None)
+        .await
+        .map_err(|e| internal_err(format!("project: {e}")))?;
+    Ok((ws, proj))
 }
 
 // ---------------------------------------------------------------------
@@ -192,41 +224,20 @@ async fn handle_search(
 async fn handle_bootstrap(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<BootstrapRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // LLM is required only for live runs. Dry-runs never call the LLM
     // so we handle them directly here without constructing Bootstrap.
     if !req.dry_run && state.llm.is_none() {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "LLM provider not configured on server"
             })),
-        );
+        ));
     }
 
     // Resolve workspace + project — create if absent.
-    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
-            );
-        }
-    };
-    let proj = match state
-        .writer
-        .get_or_create_project(ws, req.project, None)
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("project: {e}") })),
-            );
-        }
-    };
+    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
 
     // Dry-run with no LLM: compute the budget-pruned source counts and
     // return early without constructing Bootstrap (which requires an LLM).
@@ -266,15 +277,33 @@ async fn handle_bootstrap(
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {
-        Ok(outcome) => (
+        Ok(outcome) => Ok((
             StatusCode::OK,
             Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
-        ),
-        Err(e) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        )),
+        Err(e) => Err(bootstrap_error_response(e)),
     }
+}
+
+/// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
+/// same budget-pruning logic that `Bootstrap::process_sources` would use.
+/// Map a [`BootstrapError`] to the appropriate HTTP status code.
+///
+/// - `NoSources` / `AlreadyBootstrapped` → 422 (validation failures).
+/// - `Llm` → 502 (upstream provider failure).
+/// - Everything else → 500 (unexpected server-side error).
+fn bootstrap_error_response(
+    e: ai_memory_consolidate::BootstrapError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use ai_memory_consolidate::BootstrapError;
+    let status = match &e {
+        BootstrapError::NoSources | BootstrapError::AlreadyBootstrapped => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        BootstrapError::Llm(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() })))
 }
 
 /// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
@@ -282,15 +311,15 @@ async fn handle_bootstrap(
 fn dry_run_outcome(
     sources: Vec<BootstrapSource>,
     max_input_tokens: usize,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     use ai_memory_consolidate::BootstrapError;
     if sources.is_empty() {
-        return (
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": BootstrapError::NoSources.to_string()
             })),
-        );
+        ));
     }
     // Mirror the prune logic: sort by drop_priority desc, drop until
     // under budget. We replicate the constants here rather than
@@ -324,10 +353,10 @@ fn dry_run_outcome(
         rationale: "(dry-run; LLM not invoked)".to_string(),
         dry_run: true,
     };
-    (
+    Ok((
         StatusCode::OK,
         Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -567,31 +596,10 @@ fn default_project() -> String {
 async fn handle_lint(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<LintRequest>,
-) -> impl IntoResponse {
-    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
-            );
-        }
-    };
-    let proj = match state
-        .writer
-        .get_or_create_project(ws, req.project, None)
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("project: {e}") })),
-            );
-        }
-    };
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
 
-    match run_lint(
+    run_lint(
         &state.reader,
         &state.wiki,
         state.llm.as_ref(),
@@ -600,16 +608,13 @@ async fn handle_lint(
         req.dry_run,
     )
     .await
-    {
-        Ok(report) => (
+    .map(|report| {
+        (
             StatusCode::OK,
             Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+        )
+    })
+    .map_err(|e| internal_err(e.to_string()))
 }
 
 // ---------------------------------------------------------------------
@@ -633,31 +638,10 @@ struct ForgetSweepRequest {
 async fn handle_forget_sweep(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<ForgetSweepRequest>,
-) -> impl IntoResponse {
-    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
-            );
-        }
-    };
-    let proj = match state
-        .writer
-        .get_or_create_project(ws, req.project, None)
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("project: {e}") })),
-            );
-        }
-    };
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
 
-    match run_sweep(
+    run_sweep(
         &state.reader,
         &state.writer,
         ws,
@@ -666,16 +650,13 @@ async fn handle_forget_sweep(
         req.dry_run,
     )
     .await
-    {
-        Ok(report) => (
+    .map(|report| {
+        (
             StatusCode::OK,
             Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+        )
+    })
+    .map_err(|e| internal_err(e.to_string()))
 }
 
 // ---------------------------------------------------------------------
@@ -695,17 +676,24 @@ struct EmbedRequest {
     /// have one matching the current (provider, model, dim).
     #[serde(default)]
     reembed: bool,
+    /// When true, count pages that would be embedded/skipped without
+    /// calling the embedder or writing anything.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// Summary response from `POST /admin/embed`.
 #[derive(Debug, Serialize)]
 pub struct EmbedReport {
-    /// Total pages that were embedded (or would be, in dry-run mode).
+    /// Pages that were actually embedded (zero in dry-run).
     pub embedded: usize,
     /// Pages skipped because a matching embedding already existed.
     pub skipped: usize,
     /// Pages that failed to embed (read error or provider error).
     pub failed: usize,
+    /// Pages that would be embedded in a live run (only meaningful
+    /// when `dry_run` was requested).
+    pub would_embed: usize,
     /// Provider name.
     pub provider: String,
     /// Model identifier.
@@ -717,16 +705,16 @@ pub struct EmbedReport {
 async fn handle_embed(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<EmbedRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let embedder = match state.embedder.clone() {
         Some(e) => e,
         None => {
-            return (
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "error": "embedder not configured on server"
                 })),
-            );
+            ));
         }
     };
 
@@ -734,65 +722,40 @@ async fn handle_embed(
     let model = embedder.model().to_string();
     let dim = embedder.dim();
 
-    let ws = match state.writer.get_or_create_workspace(req.workspace).await {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
-            );
-        }
-    };
-    let proj = match state
-        .writer
-        .get_or_create_project(ws, req.project, None)
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("project: {e}") })),
-            );
-        }
-    };
+    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
 
-    let candidates = match state.reader.decay_candidates(ws, proj).await {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
-    };
+    let candidates = state
+        .reader
+        .decay_candidates(ws, proj)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
 
     // Build the set of page ids that already have a matching embedding.
     let already: std::collections::HashSet<_> = if req.reembed {
         std::collections::HashSet::new()
     } else {
-        match state
+        state
             .reader
             .load_embeddings(ws, proj, provider.clone(), model.clone(), dim)
             .await
-        {
-            Ok(embeddings) => embeddings.into_iter().map(|s| s.id).collect(),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                );
-            }
-        }
+            .map_err(|e| internal_err(e.to_string()))?
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
     };
 
     let mut embedded = 0_usize;
     let mut skipped = 0_usize;
     let mut failed = 0_usize;
+    let mut would_embed = 0_usize;
 
     for cand in candidates {
         if !req.reembed && already.contains(&cand.id) {
             skipped += 1;
+            continue;
+        }
+        if req.dry_run {
+            would_embed += 1;
             continue;
         }
         let md = match state.wiki.read_page(&cand.path) {
@@ -828,14 +791,15 @@ async fn handle_embed(
         embedded,
         skipped,
         failed,
+        would_embed,
         provider,
         model,
         dim,
     };
-    (
+    Ok((
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------

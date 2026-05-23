@@ -13,6 +13,7 @@ use ai_memory_core::{
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::Wiki;
+use ai_memory_wiki::WritePageRequest;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
@@ -340,4 +341,51 @@ async fn commit_clean_wiki_returns_not_committed() {
     // An empty wiki may return either false (nothing to stage) or true
     // (first commit of an empty tree). Both are acceptable; we just
     // verify the route doesn't panic.
+}
+
+#[tokio::test]
+async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+
+    // Write a page through the wiki so it lands on disk (git can see it).
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/commit-test.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Commit test", "tier": "semantic"}),
+            body: "Content for the commit test.".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Commit test".into()),
+        })
+        .await
+        .unwrap();
+
+    let resp = post(state, "/admin/commit", json!({ "message": "test commit" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp).await;
+    assert!(
+        body["committed"].as_bool().unwrap_or(false),
+        "expected committed=true after writing a page: {body}"
+    );
+    let oid = body["oid"].as_str().expect("oid field must be present");
+    assert_eq!(oid.len(), 40, "oid must be a 40-char hex SHA: {oid}");
+    assert!(
+        oid.chars().all(|c| c.is_ascii_hexdigit()),
+        "oid must be all hex digits: {oid}"
+    );
 }

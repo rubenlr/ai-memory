@@ -116,10 +116,10 @@ pub struct InstallInstructionsArgs {
 /// Arguments for `bootstrap`.
 #[derive(Debug, Args)]
 pub struct BootstrapArgs {
-    /// Path of the project repo whose history we should ingest.
-    /// Defaults to `git rev-parse --show-toplevel` resolved from the
-    /// current directory (so running bootstrap from any subdir of the
-    /// project works).
+    /// Path on this client whose history to collect (server never
+    /// sees this path). Defaults to `git rev-parse --show-toplevel`
+    /// resolved from the current directory (so running bootstrap from
+    /// any subdir of the project works).
     #[arg(long)]
     pub repo_path: Option<PathBuf>,
     /// Workspace + project labels stamped on the generated pages.
@@ -375,6 +375,12 @@ pub struct ForgetSweepArgs {
     /// Report what would be evicted without actually mutating.
     #[arg(long)]
     pub dry_run: bool,
+    /// Workspace name (auto-created if absent).
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Project name within the workspace (auto-created if absent).
+    #[arg(long, default_value = "scratch")]
+    pub project: String,
 }
 
 /// Arguments for `lint`.
