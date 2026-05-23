@@ -459,6 +459,23 @@ pub fn collect_sources(
     Ok(sources)
 }
 
+/// Walk up from `start` looking for the nearest `.git` and return
+/// the repo root path. Pure libgit2 (no `git` binary required), so
+/// the slim runtime container can resolve repo roots too.
+///
+/// # Errors
+/// Returns `BootstrapError::NotARepo` when no repository is found
+/// at or above `start`.
+pub fn discover_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> {
+    let repo = git2::Repository::discover(start)
+        .map_err(|_| BootstrapError::NotARepo(start.to_path_buf()))?;
+    // `path()` returns the .git dir; the workdir is the parent unless
+    // it's a bare repo (which bootstrap doesn't support anyway).
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| BootstrapError::NotARepo(start.to_path_buf()))
+}
+
 /// Read commits, format each as a one-paragraph entry. We include
 /// only commits with a substantive body (more than ~120 chars
 /// total) — drive-by typo-fix commits aren't worth tokens.

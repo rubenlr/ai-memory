@@ -11,10 +11,8 @@
 //! - `AI_MEMORY_SERVER_URL` — base URL of the running server.
 //! - `AI_MEMORY_AUTH_TOKEN` — bearer token if the server has auth enabled.
 
-use std::path::PathBuf;
-
-use ai_memory_consolidate::{BootstrapOutcome, collect_sources};
-use anyhow::{Context, Result, bail};
+use ai_memory_consolidate::{BootstrapOutcome, collect_sources, discover_repo_root};
+use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::cli::BootstrapArgs;
@@ -34,18 +32,14 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
     let ep = ServerEndpoint::from_env();
     info!(server = %ep.url, auth = ep.auth_token.is_some(), "bootstrap CLI configured");
 
-    // ---- repo path — auto-detect if absent -------------------------
+    // ---- repo path — auto-detect via libgit2 if absent ------------
+    // libgit2 walks up from CWD looking for `.git`, so the slim
+    // runtime container doesn't need a `git` binary.
     let repo_path = match args.repo_path {
         Some(p) => p,
-        None => resolve_repo_root().context("auto-detecting --repo-path via git rev-parse")?,
+        None => discover_repo_root(std::path::Path::new("."))
+            .context("auto-detecting --repo-path (no .git found at or above CWD)")?,
     };
-    if !repo_path.join(".git").exists() {
-        bail!(
-            "repo path {} is not a git repository (looked for {}/.git)",
-            repo_path.display(),
-            repo_path.display()
-        );
-    }
 
     // ---- collect sources locally ----------------------------------
     let sources = collect_sources(
@@ -166,21 +160,4 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
          lifecycle hooks will automatically capture your actual workflow,\n  \
          and consolidation will refine the wiki over time."
     );
-}
-
-/// `git rev-parse --show-toplevel` — finds the repo root from $PWD.
-fn resolve_repo_root() -> Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .context("running `git rev-parse --show-toplevel`")?;
-    if !output.status.success() {
-        bail!(
-            "git rev-parse failed (cwd is not inside a git repository?). \
-             stderr: {}",
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(PathBuf::from(line))
 }

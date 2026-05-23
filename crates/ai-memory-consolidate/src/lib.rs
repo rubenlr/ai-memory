@@ -16,7 +16,7 @@ pub mod types;
 
 pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource, SourceCounts,
-    SourceKind, collect_sources,
+    SourceKind, collect_sources, discover_repo_root,
 };
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,
