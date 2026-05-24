@@ -113,7 +113,12 @@ impl HookEnvelope {
     pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-        let session_id = extract_string(&raw, &["session_id", "sessionId", "session"]);
+        // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
+        // tool.execute.*/session.* events; Claude Code uses `session_id`,
+        // Codex `sessionId`. JSON keys are case-sensitive, so all three
+        // spellings must be listed or OpenCode tool events fail the
+        // "missing session_id" check in the router (issue #1).
+        let session_id = extract_string(&raw, &["session_id", "sessionId", "sessionID", "session"]);
         let cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir"]);
         let title_hint = best_title_hint(event, &raw);
         let body_excerpt = best_body_excerpt(event, &raw);
@@ -228,6 +233,25 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    /// OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
+    /// tool.execute.* / session.* events. Regression for issue #1: this
+    /// spelling must be extracted, otherwise non-session-start events
+    /// fail the router's "missing session_id" check.
+    #[test]
+    fn envelope_extracts_opencode_camelcase_session_id() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("open-code".into()),
+        };
+        let raw = serde_json::json!({
+            "sessionID": "ses_abc123",
+            "tool": "bash",
+            "callID": "call_1"
+        });
+        let env = HookEnvelope::from_query_and_body(q, raw);
+        assert_eq!(env.session_id.as_deref(), Some("ses_abc123"));
     }
 
     /// Alternative agent-name spellings all map to the same canonical

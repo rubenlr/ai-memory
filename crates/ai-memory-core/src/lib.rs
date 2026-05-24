@@ -5,6 +5,7 @@
 //! pure-compute, no IO). Nothing in here performs I/O, which keeps it
 //! trivially unit-testable and free of platform concerns.
 
+pub mod active_project;
 pub mod error;
 pub mod handoff;
 pub mod ids;
@@ -13,6 +14,7 @@ pub mod page;
 pub mod routing_snippet;
 pub mod sanitize;
 
+pub use active_project::ActiveProject;
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{

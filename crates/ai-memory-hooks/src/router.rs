@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    AgentKind, Handoff, NewHandoff, NewObservation, NewSession, ObservationKind, ProjectId,
-    Sanitized, Sanitizer, SessionId, WorkspaceId,
+    ActiveProject, AgentKind, Handoff, NewHandoff, NewObservation, NewSession, ObservationKind,
+    ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
 };
 use ai_memory_store::WriterHandle;
 use ai_memory_wiki::Wiki;
@@ -60,6 +60,11 @@ pub struct HookState {
     /// same agent session. Keyed by the raw cwd string; no
     /// canonicalisation — two symlinked paths are separate buckets.
     pub project_cache: Arc<tokio::sync::Mutex<HashMap<String, (WorkspaceId, ProjectId)>>>,
+    /// Pointer shared with the MCP server. Every cwd-resolved event
+    /// publishes its project here so the read tools (which have no cwd
+    /// of their own) default to the project the user is actually in
+    /// rather than the server's static `--project` (issue #2).
+    pub active_project: ActiveProject,
 }
 
 /// Build a router with `POST /hook` (event ingress) and `GET /handoff`
@@ -211,6 +216,10 @@ async fn resolve_project_ids(
     {
         let cache = state.project_cache.lock().await;
         if let Some(ids) = cache.get(cwd) {
+            // Republish on every hit: a cache hit still means the agent
+            // is active in this project *now*, which is exactly what the
+            // MCP read tools need as their default.
+            state.active_project.set(ids.0, ids.1);
             return Ok(*ids);
         }
     }
@@ -238,6 +247,7 @@ async fn resolve_project_ids(
         .lock()
         .await
         .insert(cwd.to_string(), ids);
+    state.active_project.set(ws, proj);
     Ok(ids)
 }
 
@@ -560,6 +570,7 @@ mod tests {
             consolidator: None,
             sanitizer,
             project_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            active_project: ActiveProject::new(),
         }
     }
 
@@ -585,6 +596,10 @@ mod tests {
         // Neither should match the server-default scratch project.
         assert_ne!(proj_a, state.project_id);
         assert_ne!(proj_b, state.project_id);
+
+        // The MCP-shared pointer reflects the most recently resolved
+        // project (issue #2) — here, project-beta.
+        assert_eq!(state.active_project.get(), Some((ws_b, proj_b)));
     }
 
     /// An event without a cwd must fall back to the server defaults.
@@ -601,6 +616,11 @@ mod tests {
         let (ws2, proj2) = resolve_project_ids(&state, Some("")).await.unwrap();
         assert_eq!(ws2, state.workspace_id);
         assert_eq!(proj2, state.project_id);
+
+        // A cwd-less event must NOT publish the scratch fallback as the
+        // active project — that would re-introduce the issue #2 bug of
+        // MCP reads defaulting to an empty scratch bucket.
+        assert!(state.active_project.get().is_none());
     }
 
     /// A second call for the same cwd must hit the in-memory cache — no

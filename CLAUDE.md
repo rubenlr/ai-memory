@@ -108,7 +108,14 @@ blocking issue:**
     without a `cwd` (e.g. early startup or misconfigured agents).
     Commands/handlers that bake in a `workspace_id`/`project_id` at
     construction time MUST look up the session's actual project (via
-    `ReaderPool::session_project_ids`) before writing.
+    `ReaderPool::session_project_ids`) before writing. The MCP read
+    tools have no cwd of their own (the protocol carries none), so they
+    resolve through `AiMemoryServer::effective_ids`: explicit `project`
+    arg → the hook-published `ActiveProject` (the cwd the agent is
+    working in, shared in-process between `/hook` and `/mcp`) → the
+    baked-in default. Never query a read tool against the static
+    `--project` alone — that re-introduces issue #2 (reads land in
+    `scratch` while hooks populate the real project).
 
     b. **Storage layout**: wiki files live at
     `<wiki_root>/<workspace_id>/<project_id>/<page-path>`. The mutable
@@ -147,6 +154,23 @@ blocking issue:**
       Both use `sysinfo` to refuse if any sibling `ai-memory` is alive.
     Use the shared `crate::http_client::{ServerEndpoint, get_json,
     post_json}` plumbing for every new client subcommand.
+17. **Wiki-structure changes require a migration.** Any change to the
+    on-disk wiki layout (path scheme, directory names, mass page rewrites)
+    MUST be accompanied by a `WikiMigration` implementation registered in
+    `crates/ai-memory-wiki/src/migrations/mod.rs`. The migration runs at
+    server startup (after refinery, before the watcher), is tracked in the
+    `wiki_migrations` SQL table, and runs at most once per data directory.
+    Rules:
+    - Migration names are `YYYY_MM_DDTHH_MM_<snake_case>` (UTC, chosen at
+      authoring time). Never change a name after it ships.
+    - Implementations must be idempotent: detect whether the work is already
+      done and return `Ok(())` immediately if so.
+    - No LLM calls and no destructive deletes without a graveyard step
+      (move to `<wiki_root>/_graveyard/<migration_name>/…` first).
+    - No direct SQL — use `WriterHandle` methods (single-writer invariant).
+    - Append to the registry; never reorder or remove entries.
+    See [`docs/wiki-migrations.md`](docs/wiki-migrations.md) for the full
+    guide and an example implementation.
 
 ## Mistakes documented in the research — do NOT repeat
 

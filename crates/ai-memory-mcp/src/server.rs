@@ -4,7 +4,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
-use ai_memory_core::{AgentKind, NewHandoff, PageId, ProjectId, SessionId, WorkspaceId};
+use ai_memory_core::{
+    ActiveProject, AgentKind, NewHandoff, PageId, ProjectId, SessionId, WorkspaceId,
+};
 use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{DecayParams, ReaderPool, WriterHandle};
 use ai_memory_wiki::Wiki;
@@ -77,6 +79,14 @@ pub struct AiMemoryServer {
     writer: WriterHandle,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    /// Project the user is currently active in, published by the hook
+    /// router on each cwd-resolved event. The read tools prefer this
+    /// over the baked-in `(workspace_id, project_id)` so a shared HTTP
+    /// server queries the project the agent is actually in rather than
+    /// the static `--project` default (issue #2). Empty until the first
+    /// hook event arrives, or always-empty in stdio mode (no shared
+    /// hook ingress) — in which case the baked-in default is used.
+    active_project: ActiveProject,
     default_limit: usize,
     /// Optional LLM consolidator. When `None`, `memory_consolidate`
     /// returns a "not configured" error.
@@ -112,6 +122,11 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Project to search. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity). Only needed when
+    /// one shared server fields several projects at once.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -119,6 +134,18 @@ struct RecentArgs {
     /// Maximum number of recent pages to return (default 10, max 100).
     #[serde(default, alias = "n")]
     limit: Option<usize>,
+    /// Project to read. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity).
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct StatusArgs {
+    /// Project to report counts for. Omit to target the project you're
+    /// currently working in (resolved from recent hook activity).
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +215,10 @@ struct BriefingArgs {
     /// How many recently-updated pages to include (default 10, max 100).
     #[serde(default)]
     recent_pages_limit: Option<usize>,
+    /// Project to brief on. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity).
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -201,6 +232,10 @@ struct ExploreArgs {
     /// consider (default 10).
     #[serde(default)]
     recent_pages_limit: Option<usize>,
+    /// Project to explore. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity).
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[tool_router]
@@ -219,6 +254,7 @@ impl AiMemoryServer {
             writer,
             workspace_id,
             project_id,
+            active_project: ActiveProject::new(),
             default_limit: 10,
             consolidator: None,
             llm: None,
@@ -244,6 +280,37 @@ impl AiMemoryServer {
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
         self
+    }
+
+    /// Share the hook router's [`ActiveProject`] pointer so the read
+    /// tools default to the project the user is currently in (issue #2).
+    /// In stdio mode there is no shared hook ingress, so callers simply
+    /// don't set this and the baked-in default is used.
+    #[must_use]
+    pub fn with_active_project(mut self, active_project: ActiveProject) -> Self {
+        self.active_project = active_project;
+        self
+    }
+
+    /// Resolve which `(workspace_id, project_id)` a read tool should
+    /// query. Precedence (matches the documented resolution chain):
+    ///   1. an explicit `project` name argument (looked up read-only in
+    ///      the server's workspace; ignored if no such project exists),
+    ///   2. the hook-published [`ActiveProject`] (the cwd the agent is
+    ///      currently working in),
+    ///   3. the server's baked-in `--project` default.
+    async fn effective_ids(&self, explicit_project: Option<&str>) -> (WorkspaceId, ProjectId) {
+        if let Some(name) = explicit_project.map(str::trim).filter(|s| !s.is_empty())
+            && let Ok(Some(pid)) = self
+                .reader
+                .find_project(self.workspace_id, name.to_string())
+                .await
+        {
+            return (self.workspace_id, pid);
+        }
+        self.active_project
+            .get()
+            .unwrap_or((self.workspace_id, self.project_id))
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -314,6 +381,7 @@ impl AiMemoryServer {
         Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
         // Hybrid path: try to embed the query; if it fails (provider
         // outage, cold-start timeout, billing, etc.) degrade to BM25
         // instead of erroring the whole query — losing semantic
@@ -323,8 +391,8 @@ impl AiMemoryServer {
                 Ok(qv) => {
                     self.reader
                         .hybrid_search(
-                            self.workspace_id,
-                            self.project_id,
+                            ws,
+                            proj,
                             args.query.clone(),
                             Some(qv),
                             embedder.provider().to_string(),
@@ -342,18 +410,13 @@ impl AiMemoryServer {
                         "embedder failed; degrading memory_query to BM25-only"
                     );
                     self.reader
-                        .search_pages_for_project(
-                            self.workspace_id,
-                            self.project_id,
-                            args.query,
-                            limit,
-                        )
+                        .search_pages_for_project(ws, proj, args.query, limit)
                         .await
                 }
             }
         } else {
             self.reader
-                .search_pages_for_project(self.workspace_id, self.project_id, args.query, limit)
+                .search_pages_for_project(ws, proj, args.query, limit)
                 .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -374,9 +437,10 @@ impl AiMemoryServer {
         Parameters(args): Parameters<RecentArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
         let hits = self
             .reader
-            .recent_pages_for_project(self.workspace_id, self.project_id, limit)
+            .recent_pages_for_project(ws, proj, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
@@ -561,10 +625,14 @@ impl AiMemoryServer {
         (pages latest, pages all versions, sessions, observations). \
         Use this at session start to see how much context the agent has \
         accumulated for this workspace.")]
-    async fn memory_status(&self) -> Result<CallToolResult, McpError> {
+    async fn memory_status(
+        &self,
+        Parameters(args): Parameters<StatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
         let counts = self
             .reader
-            .status_counts_for_project(self.workspace_id, self.project_id)
+            .status_counts_for_project(ws, proj)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let response = StatusResponse { counts };
@@ -585,9 +653,10 @@ impl AiMemoryServer {
         Parameters(args): Parameters<BriefingArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.recent_pages_limit.unwrap_or(10);
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
         let snapshot = self
             .reader
-            .briefing_for_project(self.workspace_id, self.project_id, limit)
+            .briefing_for_project(ws, proj, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         ok_json(&snapshot)
@@ -612,9 +681,10 @@ impl AiMemoryServer {
         Parameters(args): Parameters<ExploreArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.recent_pages_limit.unwrap_or(10);
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
         let snapshot = self
             .reader
-            .briefing_for_project(self.workspace_id, self.project_id, limit)
+            .briefing_for_project(ws, proj, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -885,6 +955,46 @@ mod tests {
         let (_tmp, _store, _server, _ws, _pj) = setup_server().await;
     }
 
+    /// Read tools resolve the project in the order: explicit `project`
+    /// arg → hook-published active project → baked-in default (issue #2).
+    #[tokio::test]
+    async fn effective_ids_follows_precedence_chain() {
+        let (_tmp, store, server, ws, baked) = setup_server().await;
+
+        // Baseline: nothing published, no arg → baked-in default.
+        assert_eq!(server.effective_ids(None).await, (ws, baked));
+
+        // A second real project in the same workspace.
+        let other = store
+            .writer
+            .get_or_create_project(
+                ws,
+                "projeto_camera",
+                Some("/home/u/projeto_camera".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Hook publishes it → it becomes the default for cwd-less calls.
+        server.active_project.set(ws, other);
+        assert_eq!(server.effective_ids(None).await, (ws, other));
+
+        // An explicit (existing) project arg wins over the active pointer.
+        assert_eq!(
+            server.effective_ids(Some("scratch")).await,
+            (ws, baked),
+            "explicit project arg should override the active pointer"
+        );
+
+        // An explicit but unknown project name falls through to the
+        // active pointer rather than erroring or returning a bogus id.
+        assert_eq!(
+            server.effective_ids(Some("does-not-exist")).await,
+            (ws, other),
+            "unknown explicit project falls through to the active pointer"
+        );
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -892,6 +1002,7 @@ mod tests {
             .memory_query(Parameters(QueryArgs {
                 query: "karpathy".into(),
                 limit: Some(5),
+                project: None,
             }))
             .await
             .unwrap();
@@ -905,7 +1016,10 @@ mod tests {
     #[tokio::test]
     async fn memory_status_returns_counts() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
-        let result = server.memory_status().await.unwrap();
+        let result = server
+            .memory_status(Parameters(StatusArgs { project: None }))
+            .await
+            .unwrap();
         let text = result
             .content
             .first()
@@ -921,6 +1035,7 @@ mod tests {
         let result = server
             .memory_briefing(Parameters(BriefingArgs {
                 recent_pages_limit: Some(5),
+                project: None,
             }))
             .await
             .unwrap();
@@ -963,6 +1078,7 @@ mod tests {
             .memory_explore(Parameters(ExploreArgs {
                 focus: None,
                 recent_pages_limit: Some(5),
+                project: None,
             }))
             .await
             .unwrap();
@@ -1019,7 +1135,10 @@ mod tests {
     async fn memory_recent_returns_one_hit() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_recent(Parameters(RecentArgs { limit: Some(5) }))
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(5),
+                project: None,
+            }))
             .await
             .unwrap();
         let text = result
@@ -1167,6 +1286,7 @@ mod tests {
             .memory_query(Parameters(QueryArgs {
                 query: "Karpathy".into(),
                 limit: Some(99_999),
+                project: None,
             }))
             .await
             .expect("oversized limit should be clamped, not refused");
@@ -1191,6 +1311,7 @@ mod tests {
             .memory_query(Parameters(QueryArgs {
                 query: "\"unbalanced".into(),
                 limit: Some(10),
+                project: None,
             }))
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or

@@ -9,7 +9,7 @@ use ai_memory_llm::{build_embedder, build_provider, embedder_from_env, provider_
 use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
 use ai_memory_store::Store;
 use ai_memory_web;
-use ai_memory_wiki::{WatcherHandle, Wiki};
+use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -44,6 +44,19 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
+
+    // Run any outstanding wiki-structure migrations before the watcher starts
+    // so file moves and renames are never raced by the reconciler.
+    let wiki_root = config.data_dir.join("wiki");
+    run_wiki_migrations(
+        &store.writer,
+        &store.reader,
+        &wiki_root,
+        &migrations::registry(),
+    )
+    .await
+    .with_context(|| "applying wiki-structure migrations")?;
+
     let ws = store
         .writer
         .get_or_create_workspace(args.workspace.clone())
@@ -102,9 +115,17 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Some(WatcherHandle::start(wiki.clone())?)
     };
 
+    // Shared between the MCP server and the hook router: the hook
+    // router publishes the cwd-resolved project on each event; the MCP
+    // read tools read it as their default so a shared HTTP server
+    // answers for the project the agent is actually in, not the static
+    // `--project` (issue #2). In stdio mode no hook router is built, so
+    // this stays empty and the baked-in default is used.
+    let active_project = ai_memory_core::ActiveProject::new();
     let mut server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
         .with_wiki(wiki.clone())
         .with_decay_params(config.decay)
+        .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone());
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
@@ -178,6 +199,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 project_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
+                active_project: active_project.clone(),
             });
             let admin = admin_router(AdminState {
                 writer: store.writer.clone(),
