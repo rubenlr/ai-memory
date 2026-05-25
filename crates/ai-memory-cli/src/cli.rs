@@ -328,9 +328,8 @@ pub struct RestoreArgs {
     pub force: bool,
 }
 
-/// Agent CLI to install hooks for. Only the three with lifecycle
-/// hooks are listed; for MCP-only clients (Cursor, Claude Desktop,
-/// Gemini CLI, OpenClaw), use `install-mcp --client <name>` instead.
+/// Agent CLI to install hooks/extensions for. For MCP-only clients
+/// (Claude Desktop, OpenClaw), use `install-mcp --client <name>` instead.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum AgentChoice {
     /// Anthropic Claude Code.
@@ -352,6 +351,11 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
+    /// Oh My Pi (`omp`) / Pi coding agent fork — TypeScript extension
+    /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
+    /// file directly; restart `omp` for it to load.
+    #[value(alias = "pi", alias = "oh-my-pi")]
+    Omp,
     /// OpenClaw personal AI gateway — **no lifecycle hooks**;
     /// `install-hooks --apply --agent openclaw` prints an
     /// explanation and exits without mutating anything.
@@ -383,8 +387,8 @@ pub enum McpClient {
     GeminiCli,
     /// OpenClaw personal AI gateway — `~/.openclaw/config.json`.
     Openclaw,
-    /// Mario Zechner's `pi` coding agent. NOT supported via MCP
-    /// upstream; this prints the explanation + alternatives.
+    /// Oh My Pi (`omp`) / Pi-compatible coding agent — `~/.omp/agent/mcp.json`.
+    #[value(alias = "omp", alias = "oh-my-pi")]
     Pi,
 }
 
@@ -510,8 +514,7 @@ pub struct InstallHooksArgs {
     /// written next to the original before each modifying write.
     #[arg(long)]
     pub apply: bool,
-    /// Override the settings.json path (auto-detected as
-    /// `~/.claude/settings.json`).
+    /// Override the settings/plugin/extension file path for the selected agent.
     #[arg(long)]
     pub config_file: Option<PathBuf>,
 }

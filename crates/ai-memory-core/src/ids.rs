@@ -169,6 +169,8 @@ pub enum AgentKind {
     Codex,
     /// OpenCode (open-source coding agent).
     OpenCode,
+    /// Oh My Pi (`omp`) / Pi-compatible coding agent.
+    Omp,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -181,6 +183,7 @@ impl AgentKind {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::OpenCode => "open-code",
+            Self::Omp => "omp",
             Self::Other => "other",
         }
     }
@@ -251,5 +254,8 @@ mod tests {
         assert_eq!(s, "\"claude-code\"");
         let back: AgentKind = serde_json::from_str(&s).unwrap();
         assert_eq!(back, k);
+
+        let omp = serde_json::to_string(&AgentKind::Omp).unwrap();
+        assert_eq!(omp, "\"omp\"");
     }
 }

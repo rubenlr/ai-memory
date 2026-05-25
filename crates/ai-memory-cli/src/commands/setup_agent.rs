@@ -49,8 +49,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
         ..args
     };
-    if matches!(args.agent, AgentChoice::OpenCode) {
-        emit_opencode_setup_hint(&args);
+    if matches!(args.agent, AgentChoice::OpenCode | AgentChoice::Omp) {
+        emit_extension_setup_hint(&args);
         return Ok(());
     }
     let agent_sub = match args.agent {
@@ -59,6 +59,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::Cursor => "cursor",
         AgentChoice::GeminiCli => "gemini-cli",
         AgentChoice::OpenCode => unreachable!("opencode handled above"),
+        AgentChoice::Omp => unreachable!("omp handled above"),
         AgentChoice::Openclaw => {
             anyhow::bail!(
                 "OpenClaw has no lifecycle hooks (only HTTP webhooks); \
@@ -123,6 +124,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             emit_other(&emit_root, agent_sub, &args);
         }
         AgentChoice::OpenCode => unreachable!("opencode handled above"),
+        AgentChoice::Omp => unreachable!("omp handled above"),
         AgentChoice::Openclaw => {
             // Unreachable — the early bail at the top of run()
             // catches openclaw before we get here. Defensive
@@ -134,10 +136,25 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
-fn emit_opencode_setup_hint(args: &SetupAgentArgs) {
-    println!("# OpenCode uses a TypeScript plugin, not extracted shell scripts.");
+fn emit_extension_setup_hint(args: &SetupAgentArgs) {
+    let (label, agent, restart_note, mcp_client) = match args.agent {
+        AgentChoice::OpenCode => (
+            "OpenCode",
+            "opencode",
+            "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts.",
+            "opencode",
+        ),
+        AgentChoice::Omp => (
+            "OMP",
+            "omp",
+            "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory.ts.",
+            "pi",
+        ),
+        _ => unreachable!("only extension-based agents reach this hint"),
+    };
+    println!("# {label} uses a TypeScript extension/plugin, not extracted shell scripts.");
     println!("# Install it directly instead:");
-    println!("ai-memory install-hooks --agent opencode --apply \\");
+    println!("ai-memory install-hooks --agent {agent} --apply \\");
     if args.auth_token.is_some() {
         println!("  --server-url {} \\", args.server_url);
         println!("  --auth-token <token>");
@@ -146,7 +163,8 @@ fn emit_opencode_setup_hint(args: &SetupAgentArgs) {
         println!("  # add --auth-token <token> if the server requires bearer auth");
     }
     println!();
-    println!("Also run `ai-memory install-mcp --client opencode` to wire MCP separately.");
+    println!("{restart_note}");
+    println!("Also run `ai-memory install-mcp --client {mcp_client}` to wire MCP separately.");
 }
 
 fn emit_claude_code(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {

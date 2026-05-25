@@ -95,7 +95,7 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 
 Three capture surfaces, in priority order:
 
-1. **Lifecycle hooks** (Claude Code, Codex, OpenCode). These are fast, reliable, structured. We ship hook scripts the user installs once. Lessons from agentmemory:
+1. **Lifecycle hooks/extensions** (Claude Code, Codex, OpenCode, OMP). These are fast, reliable, structured. We ship hook scripts or generated TypeScript integrations the user installs once. Lessons from agentmemory:
   - Hooks must be **fire-and-forget** (#221). No `await fetch()` blocking session start.
   - Sub-second hard timeouts on the writer side (`tokio::time::timeout`).
   - All hooks → single HTTP/Unix-socket POST → server queues → returns 202 immediately.

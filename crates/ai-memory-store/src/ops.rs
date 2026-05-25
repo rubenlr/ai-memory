@@ -473,6 +473,7 @@ fn agent_kind_as_str(kind: AgentKind) -> &'static str {
         AgentKind::ClaudeCode => "claude-code",
         AgentKind::Codex => "codex",
         AgentKind::OpenCode => "open-code",
+        AgentKind::Omp => "omp",
         AgentKind::Other => "other",
     }
 }

@@ -49,8 +49,8 @@ priors are at the [bottom](#influences-and-prior-art).
   mode. Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
-  Gemini CLI, OpenClaw. Server runs local (loopback) OR on a homelab
-  box (LAN/VPN/cloud) with bearer-token auth.
+  Gemini CLI, OpenClaw, Oh My Pi / OMP. Server runs local (loopback)
+  OR on a homelab box (LAN/VPN/cloud) with bearer-token auth.
 - **Thin-client CLI.** `ai-memory bootstrap`, `purge-project`,
   `rename-project`, `lint`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
@@ -90,7 +90,7 @@ priors are at the [bottom](#influences-and-prior-art).
 
 ## Quick start
 
-You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, Cursor,
+You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, OMP, Cursor,
 or anything else that speaks MCP).
 
 The default quick-start has **no authentication** - the server binds
@@ -129,7 +129,8 @@ docker run -d --name ai-memory \
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts + auto-detecting ~/.claude/settings.json. Re-run with
-#    `--agent codex`, `--agent opencode`, `--client cursor`, etc.
+#    `--agent codex`, `--agent opencode`, `--agent omp`,
+#    `--client cursor`, etc.
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
@@ -199,7 +200,7 @@ source (e.g. a fork or a tagged release).
 > read-only); daily use from inside the sandbox needs no binary at
 > all (agents reach ai-memory over MCP).
 
-**For everything else** - Codex, OpenCode, Cursor, Claude Desktop,
+**For everything else** - Codex, OpenCode, OMP, Cursor, Claude Desktop,
 Gemini CLI, OpenClaw, the curl-based hook installer (no docker
 needed), running ai-memory without docker, the full subcommand
 reference, the homelab deploy pattern, security hardening - see
@@ -693,7 +694,7 @@ data-flow diagram + crate breakdown + cross-cutting invariants.
 | File | What it is |
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
-| [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP config snippets (Cursor, Claude Desktop, Gemini CLI, OpenClaw, pi). |
+| [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP config snippets (Cursor, Claude Desktop, Gemini CLI, OpenClaw, OMP). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, TLS via cloudflared. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset.** Safety matrix for the state-touching commands, per-project disk layout (how isolation actually works), and operator workflows for "fresh start", "snapshot before risky op", "drop one project". |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |

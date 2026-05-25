@@ -19,38 +19,37 @@
 This page documents how to register ai-memory as an MCP server with
 the agent CLIs **that are not covered inline in the README**.
 
-The three flagship clients - Claude Code, OpenAI Codex, OpenCode -
-have automatic capture integrations (shell hooks for Claude Code /
-Codex, a TypeScript plugin for OpenCode) and are covered in the
+Claude Code, OpenAI Codex, OpenCode, and OMP have automatic capture
+integrations (shell hooks for Claude Code / Codex, TypeScript
+plugin/extension files for OpenCode / OMP) and are covered in the
 [main README](../README.md#configure-your-agent-cli).
 
-The clients on this page are **MCP-only**: they expose long-term
+Some clients on this page are **MCP-only**: they expose long-term
 memory to their LLM via ai-memory's MCP tools (`memory_query`,
-`memory_recent`, `memory_handoff_accept`, etc.), but they cannot
-auto-capture session events into ai-memory's `/hook` endpoint
-without a per-client plugin written upstream. The trade-off:
+`memory_recent`, `memory_handoff_accept`, etc.), but they do not
+auto-capture session events into ai-memory's `/hook` endpoint. The
+trade-off:
 
 | | What you get | What you don't get |
 |---|---|---|
 | **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate | No automatic session-end summaries; no auto-handoff at session boundaries |
 | **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting | - |
 
-Most of these clients will land hook integration upstream eventually
-(Gemini CLI is the closest); for now, you can still cover the
-session-boundary gap by asking the LLM to call `memory_handoff_begin`
-manually before quitting.
+For MCP-only clients, you can still cover the session-boundary gap by
+asking the LLM to call `memory_handoff_begin` manually before quitting.
 
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client cursor       # or claude-desktop / gemini-cli / openclaw / pi
+> ai-memory install-mcp --client cursor       # or claude-desktop / gemini-cli / openclaw / pi|omp
 > ```
 
 ---
 
 ## Cursor
 
-**Status:** ✅ MCP supported. ❌ No lifecycle hooks.
+**Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
+`ai-memory install-hooks --agent cursor --apply`.
 
 **Config file:**
 - Per-project: `.cursor/mcp.json` in the workspace root.
@@ -114,10 +113,8 @@ stdio shim. Requires Node.js installed on the same machine.
 
 ## Gemini CLI
 
-**Status:** ✅ MCP supported. ⚠️ Hooks exist in the source but are
-not yet stable enough to recommend (the user-facing docs are sparse
-and event names have shifted between versions). Treat this as
-MCP-only for now.
+**Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
+`ai-memory install-hooks --agent gemini-cli --apply`.
 
 **Config file:**
 - User: `~/.gemini/settings.json`
@@ -140,9 +137,6 @@ endpoints. The `timeout` is in milliseconds.
 **Gotchas:**
 - Gemini supports stdio too via `command`/`args`, plus SSE via `url`.
   Only `httpUrl` covers streamable HTTP. Don't mix them in one entry.
-- If hooks are surfaced and stabilised upstream, ai-memory will ship
-  a Gemini hook bundle in `hooks/gemini-cli/`. Track:
-  <https://github.com/google-gemini/gemini-cli>.
 - Source: <https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md>
 
 ---
@@ -183,37 +177,46 @@ OpenClaw distinguishes transports explicitly. Use
 
 ---
 
-## pi (not supported via MCP) {#pi-not-supported}
+## Oh My Pi / OMP
 
-**Status:** ❌ MCP not supported upstream. Author Mario Zechner has
-[explicitly stated](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/)
-that MCP is not on pi's roadmap, citing the token-budget overhead of
-typical MCP servers.
+**Status:** ✅ MCP supported. ✅ Lifecycle capture supported via
+`ai-memory install-hooks --agent omp --apply`.
 
-The upstream [agentmemory](https://github.com/rohitg00/agentmemory)
-project wires pi via pi's own extension surface
-(`~/.pi/agent/extensions/agentmemory/`), not MCP. Implementing that
-for ai-memory is feasible but would require a separate pi-specific
-plugin and is out of scope for ai-memory v0.2.
+**Config file:**
+- User: `~/.omp/agent/mcp.json`
+- Project: `.omp/mcp.json`
 
-**What you can do today:**
+The current Oh My Pi package exposes the `omp` binary and native
+`.omp` config directories. The ai-memory CLI accepts `--client pi` and
+`--client omp` as aliases for this same MCP surface.
 
-1. **Best:** run ai-memory and use it from one of the MCP-capable
-   clients listed above (Cursor, Claude Desktop, Gemini CLI,
-   OpenClaw, or any of the flagship three in the README). Keep pi
-   for the code-edit sessions that don't need cross-agent
-   continuity. ai-memory's wiki dir is plain markdown; you can open
-   it in any editor pi has access to.
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "enabled": true
+    }
+  }
+}
+```
 
-2. **Unofficial:** there's a community [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)
-   shim that bridges MCP into pi. Not endorsed by pi's author, may
-   break on pi updates. If you try it, point it at ai-memory's
-   `http://127.0.0.1:49374/mcp` endpoint.
+**Lifecycle extension:**
 
-3. **Future:** open an issue on
-   <https://github.com/akitaonrails/ai-memory> requesting a native pi
-   extension if there's enough demand. The work is straightforward
-   (pi extensions are plain JS); just not prioritised today.
+```bash
+ai-memory install-hooks --agent omp --apply
+```
+
+This writes `~/.omp/agent/extensions/ai-memory.ts`, which OMP discovers
+as a direct TypeScript extension on startup. Restart `omp` after
+installing or changing the file.
+
+**Gotchas:**
+- OMP extensions are TypeScript modules, not shell hooks; stdout is not
+  used for context injection.
+- The extension uses OMP lifecycle events for prompt/tool capture and
+  `before_agent_start` to inject pending ai-memory handoffs.
 
 ---
 
@@ -240,9 +243,9 @@ isn't being picked up. Check:
    return a JSON-RPC error (not a connection refused). If refused,
    start ai-memory: `docker start ai-memory` or
    `ai-memory serve --transport http`.
-2. **Did the client reload the config?** Cursor and Claude Desktop
-   need a restart. Gemini CLI and OpenClaw usually pick it up on next
-   session-start.
+2. **Did the client reload the config?** Cursor, Claude Desktop, and
+   OMP need a restart. Gemini CLI and OpenClaw usually pick it up on
+   next session-start.
 3. **Are you on the right port?** ai-memory's default is **49374**
    (`0xC0DE` in hex). If you remapped, update the URL in every
    client's config.
@@ -262,8 +265,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code; Codex uses its stop/session hooks. OpenCode has no true session-end event, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / OpenCode. (b) works for any MCP-capable client if you nudge the model - see [the CLAUDE.md snippet](../README.md#nudging-the-agent-to-use-memory-proactively). |
+| **Ending side** | The agent must create a handoff, either through a true session-end hook or by calling `memory_handoff_begin`. | Built-in for Claude Code, Codex, and OMP. OpenCode has no true session-end event, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / OpenCode / OMP. (b) works for any MCP-capable client if you nudge the model - see [the CLAUDE.md snippet](../README.md#nudging-the-agent-to-use-memory-proactively). |
 
 So a typical mixed workflow looks like:
 

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct HookQuery {
     /// Lifecycle event identifier (kebab-case or snake_case).
     pub event: String,
-    /// Agent CLI identifier (`claude-code`, `codex`, `open-code`).
+    /// Agent CLI identifier (`claude-code`, `codex`, `open-code`, `omp`).
     pub agent: Option<String>,
 }
 
@@ -100,6 +100,7 @@ pub fn parse_agent(s: &str) -> AgentKind {
         "claude-code" | "claude_code" | "claude" => AgentKind::ClaudeCode,
         "codex" => AgentKind::Codex,
         "open-code" | "opencode" => AgentKind::OpenCode,
+        "omp" | "pi" | "oh-my-pi" => AgentKind::Omp,
         _ => AgentKind::Other,
     }
 }
@@ -415,6 +416,9 @@ mod tests {
         assert_eq!(parse_agent("codex"), AgentKind::Codex);
         assert_eq!(parse_agent("opencode"), AgentKind::OpenCode);
         assert_eq!(parse_agent("open-code"), AgentKind::OpenCode);
+        assert_eq!(parse_agent("omp"), AgentKind::Omp);
+        assert_eq!(parse_agent("pi"), AgentKind::Omp);
+        assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.

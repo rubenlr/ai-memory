@@ -11,9 +11,8 @@
 //! community-standard `npx mcp-remote` stdio shim so the same HTTP
 //! endpoint still works.
 //!
-//! For clients that don't support MCP at all (`pi` per the upstream
-//! author's stated position), we print an explanation + pointers
-//! instead of fabricating a config.
+//! OMP/Pi uses a native `~/.omp/agent/mcp.json` file with the same
+//! `mcpServers` root as several other clients.
 
 use std::path::PathBuf;
 
@@ -36,12 +35,6 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         ..args
     };
     if args.apply {
-        if matches!(args.client, McpClient::Pi) {
-            bail!(
-                "--apply is not supported for `pi` — pi has no MCP config to mutate. \
-                 Run without --apply to print the non-support explanation."
-            );
-        }
         return apply_to_config_file(&args);
     }
     let snippet = match args.client {
@@ -52,7 +45,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::ClaudeDesktop => render_claude_desktop(&args)?,
         McpClient::GeminiCli => render_gemini_cli(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
-        McpClient::Pi => render_pi_explanation(&args),
+        McpClient::Pi => render_pi(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -105,7 +98,7 @@ fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
         }
         McpClient::GeminiCli => home.join(".gemini").join("settings.json"),
         McpClient::Openclaw => home.join(".openclaw").join("config.json"),
-        McpClient::Pi => bail!("pi has no MCP config file (MCP not supported)"),
+        McpClient::Pi => home.join(".omp").join("agent").join("mcp.json"),
     })
 }
 
@@ -117,7 +110,8 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         McpClient::ClaudeCode
         | McpClient::ClaudeDesktop
         | McpClient::Cursor
-        | McpClient::GeminiCli => apply_atomic(&path, |existing| {
+        | McpClient::GeminiCli
+        | McpClient::Pi => apply_atomic(&path, |existing| {
             mutate_json(existing, |root| {
                 let entry = build_mcp_entry(args)?;
                 let servers = root
@@ -161,7 +155,6 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
         McpClient::Codex => apply_atomic(&path, |existing| {
             mutate_toml(existing, |doc| codex_upsert_mcp_server(doc, args))
         })?,
-        McpClient::Pi => unreachable!("pi guarded above"),
     };
     println!(
         "✓ {} {} ({})",
@@ -210,6 +203,14 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::GeminiCli => {
             entry.insert("httpUrl".into(), json!(args.server_url));
             entry.insert("timeout".into(), json!(5000));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::Pi => {
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(args.server_url));
+            entry.insert("enabled".into(), json!(true));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -520,26 +521,25 @@ fn render_openclaw(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
-fn render_pi_explanation(_args: &InstallMcpArgs) -> String {
-    // No JSON to print. Plain-text explanation + pointers; mirrors
-    // the docs/mcp-install.md#pi section so the help is self-contained.
-    "# pi (@mariozechner/pi-coding-agent) — NOT supported via MCP\n\
-     #\n\
-     # pi's author has stated MCP support is not on the roadmap; see\n\
-     # https://mariozechner.at/posts/2025-11-30-pi-coding-agent/ for the\n\
-     # design rationale (token-budget concerns). agentmemory itself uses\n\
-     # pi's native extension surface instead of MCP.\n\
-     #\n\
-     # Options if you want ai-memory + pi:\n\
-     #   1. Run ai-memory and use it from another client (Claude Code,\n\
-     #      Codex, Cursor, Gemini CLI) for the cross-agent handoff;\n\
-     #      keep pi for code-edit sessions you don't need to persist.\n\
-     #   2. Use the third-party `pi-mcp-adapter` shim\n\
-     #      (https://github.com/nicobailon/pi-mcp-adapter) — unofficial,\n\
-     #      community-maintained, may break on pi updates.\n\
-     #\n\
-     # See docs/mcp-install.md#pi-not-supported for the full discussion.\n"
-        .to_string()
+fn render_pi(args: &InstallMcpArgs) -> Result<String> {
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("http"));
+    entry.insert("url".into(), json!(args.server_url));
+    entry.insert("enabled".into(), json!(true));
+    if let Some(b) = bearer_header_value(args.auth_token.as_deref()) {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(format!(
+        "# Oh My Pi / OMP — merge into ~/.omp/agent/mcp.json:\n\
+         #\n\
+         # The current Oh My Pi package exposes the `omp` binary and native\n\
+         # `.omp` config directories; `pi` is accepted here as the compatible\n\
+         # client name. Restart `omp` after changing MCP config.\n\
+         {snippet}\n",
+        snippet = serde_json::to_string_pretty(&json!({
+            "mcpServers": { args.name.as_str(): entry }
+        }))?,
+    ))
 }
 
 #[cfg(test)]
@@ -578,13 +578,12 @@ mod tests {
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
-            McpClient::Pi => render_pi_explanation(&args),
+            McpClient::Pi => render_pi(&args).unwrap(),
         }
     }
 
-    /// With `--auth-token` set, every non-pi renderer must embed the
-    /// Bearer header in its output. pi prints the same non-support
-    /// message regardless.
+    /// With `--auth-token` set, every renderer must embed the Bearer
+    /// header in its output.
     #[test]
     fn auth_token_threaded_into_every_client() {
         for client in [
@@ -595,6 +594,7 @@ mod tests {
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
             McpClient::Openclaw,
+            McpClient::Pi,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -613,8 +613,7 @@ mod tests {
     }
 
     /// Sanity: every supported client renders without error and the
-    /// output mentions the configured server URL (or, for pi, the
-    /// "not supported" verbiage).
+    /// output mentions the configured server URL.
     #[test]
     fn every_client_renders() {
         for client in [
@@ -628,17 +627,10 @@ mod tests {
             McpClient::Pi,
         ] {
             let out = render_for_test(client);
-            if matches!(client, McpClient::Pi) {
-                assert!(
-                    out.contains("NOT supported"),
-                    "pi must explain non-support: {out}"
-                );
-            } else {
-                assert!(
-                    out.contains("http://127.0.0.1:49374/mcp"),
-                    "client {client:?} did not include the server URL in output:\n{out}"
-                );
-            }
+            assert!(
+                out.contains("http://127.0.0.1:49374/mcp"),
+                "client {client:?} did not include the server URL in output:\n{out}"
+            );
         }
     }
 
@@ -652,7 +644,7 @@ mod tests {
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
-            McpClient::Pi => render_pi_explanation(&args),
+            McpClient::Pi => render_pi(&args).unwrap(),
         }
     }
 
@@ -667,6 +659,7 @@ mod tests {
         assert!(render_for_test(McpClient::ClaudeDesktop).contains("mcp-remote"));
         assert!(render_for_test(McpClient::Openclaw).contains("\"streamable-http\""));
         assert!(render_for_test(McpClient::Codex).contains("[mcp_servers.ai-memory]"));
+        assert!(render_for_test(McpClient::Pi).contains("~/.omp/agent/mcp.json"));
     }
 
     /// The Codex apply path must emit block-form `[mcp_servers.<name>]`

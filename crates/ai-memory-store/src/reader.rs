@@ -1623,6 +1623,7 @@ fn parse_agent(s: &str) -> AgentKind {
         "claude-code" => AgentKind::ClaudeCode,
         "codex" => AgentKind::Codex,
         "open-code" => AgentKind::OpenCode,
+        "omp" => AgentKind::Omp,
         _ => AgentKind::Other,
     }
 }
