@@ -37,6 +37,10 @@ use crate::config::{Config, MaintenanceSettings};
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const EMBEDDING_WRITE_BATCH: usize = 100;
 
+/// `POST /admin/bootstrap` may carry a large JSON array of sources even
+/// after client-side prune; keep hooks/MCP at [`MAX_BODY_BYTES`].
+const BOOTSTRAP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
@@ -189,7 +193,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let router = axum::Router::new()
                 .nest_service("/mcp", mcp_service)
                 .merge(hooks)
-                .merge(admin);
+                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+                .merge(
+                    admin.layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES)),
+                );
             let router =
                 mount_web_router(router, args.enable_web, store.reader.clone(), wiki.clone());
             let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
@@ -545,7 +552,6 @@ fn apply_http_layers(
             Arc::new(allowed_hosts),
             require_allowed_host,
         ))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 async fn require_allowed_host(

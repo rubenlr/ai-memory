@@ -85,7 +85,24 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
         !args.exclude_docs,
         !args.exclude_code,
     )?;
-    info!(sources = sources.len(), "collected sources from repo");
+    let collected = sources.len();
+    let (sources, dropped, est_tokens) =
+        prune_sources_to_budget(sources, args.max_input_tokens);
+    let chunk_budget = ai_memory_consolidate::effective_chunk_budget(
+        args.chunk_input_tokens,
+        args.max_input_tokens,
+    );
+    let llm_chunks =
+        ai_memory_consolidate::plan_bootstrap_chunks(sources.clone(), chunk_budget).len();
+    info!(
+        collected,
+        kept = sources.len(),
+        dropped,
+        est_tokens,
+        llm_chunks,
+        chunk_budget,
+        "pruned sources to token budget before POST (avoids 413 on large repos)"
+    );
 
     // ---- short-circuit when --dry-run -----------------------------
     // The previous flow POSTed the full source bundle to the server
@@ -100,7 +117,11 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     // they bootstrapped something. Mirror that here.
     if args.dry_run {
         ensure_sources_for_dry_run(&sources)?;
-        let outcome = local_dry_run(sources, args.max_input_tokens);
+        let outcome = local_dry_run(
+            sources,
+            args.max_input_tokens,
+            args.chunk_input_tokens,
+        );
         print_human_report(&outcome, &args.workspace, &project);
         let report = serde_json::to_string_pretty(&outcome)?;
         println!("\n--- machine-readable ---\n{report}");
@@ -112,7 +133,9 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
         "workspace": args.workspace,
         "project": project,
         "sources": sources,
+        "sources_collected": collected,
         "max_input_tokens": args.max_input_tokens,
+        "chunk_input_tokens": args.chunk_input_tokens,
         "dry_run": args.dry_run,
         "force": args.force,
     });
@@ -146,10 +169,18 @@ fn ensure_sources_for_dry_run(sources: &[BootstrapSource]) -> Result<()> {
 /// kinds, estimate tokens) without making the HTTP request. Used to
 /// short-circuit the network round-trip when the user only wants a
 /// preview of what would be sent.
-fn local_dry_run(sources: Vec<BootstrapSource>, max_input_tokens: usize) -> BootstrapOutcome {
+fn local_dry_run(
+    sources: Vec<BootstrapSource>,
+    max_input_tokens: usize,
+    chunk_input_tokens: usize,
+) -> BootstrapOutcome {
     let collected = sources.len();
     let (kept, dropped, est_tokens) = prune_sources_to_budget(sources, max_input_tokens);
     let kept_counts = SourceCounts::from_sources(&kept);
+    let chunk_budget =
+        ai_memory_consolidate::effective_chunk_budget(chunk_input_tokens, max_input_tokens);
+    let llm_chunks =
+        ai_memory_consolidate::plan_bootstrap_chunks(kept.clone(), chunk_budget).len();
     BootstrapOutcome {
         sources_collected: collected,
         sources_sent: kept.len(),
@@ -159,6 +190,7 @@ fn local_dry_run(sources: Vec<BootstrapSource>, max_input_tokens: usize) -> Boot
         pages_written: Vec::new(),
         rationale: "(dry-run; LLM not invoked, no network round-trip)".to_string(),
         dry_run: true,
+        llm_chunks,
     }
 }
 
@@ -224,6 +256,9 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
             String::new()
         }
     );
+    if outcome.llm_chunks > 1 {
+        println!("  -> {} sequential LLM chunk{}", outcome.llm_chunks, if outcome.llm_chunks == 1 { "" } else { "s" });
+    }
 
     if outcome.dry_run {
         println!("\n(dry-run -- no LLM call, no pages written)");
@@ -273,7 +308,11 @@ mod tests {
         // The CLI handler refuses to call `local_dry_run` with zero
         // sources (server parity — see `anyhow::ensure!` in `run`),
         // so the lowest input we can hand the helper is one source.
-        let outcome = local_dry_run(vec![source(SourceKind::Readme, "README", 50)], 150_000);
+        let outcome = local_dry_run(
+            vec![source(SourceKind::Readme, "README", 50)],
+            150_000,
+            ai_memory_consolidate::DEFAULT_CHUNK_INPUT_TOKENS,
+        );
         assert!(outcome.dry_run);
         assert_eq!(outcome.sources_collected, 1);
         assert_eq!(outcome.sources_sent, 1);
@@ -289,7 +328,11 @@ mod tests {
             source(SourceKind::GitCommit, "fix: y", 100),
             source(SourceKind::DocFile, "docs/a.md", 300),
         ];
-        let outcome = local_dry_run(sources, 150_000);
+        let outcome = local_dry_run(
+            sources,
+            150_000,
+            ai_memory_consolidate::DEFAULT_CHUNK_INPUT_TOKENS,
+        );
         assert_eq!(outcome.sources_collected, 4);
         assert_eq!(outcome.sources_sent, 4);
         assert_eq!(outcome.sources_dropped, 0);
@@ -330,7 +373,11 @@ mod tests {
         let sources: Vec<_> = (0..30)
             .map(|i| source(SourceKind::GitCommit, &format!("commit {i}"), 1000))
             .collect();
-        let outcome = local_dry_run(sources, 2_000);
+        let outcome = local_dry_run(
+            sources,
+            2_000,
+            ai_memory_consolidate::DEFAULT_CHUNK_INPUT_TOKENS,
+        );
         assert!(
             outcome.sources_dropped > 0,
             "should drop at least one source under tight budget"

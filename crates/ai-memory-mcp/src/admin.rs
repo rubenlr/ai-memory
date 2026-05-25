@@ -92,9 +92,15 @@ struct BootstrapRequest {
     project: String,
     /// Sources pre-collected on the client side.
     sources: Vec<BootstrapSource>,
+    /// Original collection size before client-side prune (if any).
+    #[serde(default)]
+    sources_collected: Option<usize>,
     /// Maximum input tokens for LLM call.
     #[serde(default = "default_max_input_tokens")]
     max_input_tokens: usize,
+    /// Per-LLM-call input cap; larger bundles are split into chunks.
+    #[serde(default = "default_chunk_input_tokens")]
+    chunk_input_tokens: usize,
     /// Skip the LLM call and page writes — returns a dry-run outcome.
     #[serde(default)]
     dry_run: bool,
@@ -105,6 +111,10 @@ struct BootstrapRequest {
 
 fn default_max_input_tokens() -> usize {
     50_000
+}
+
+fn default_chunk_input_tokens() -> usize {
+    ai_memory_consolidate::DEFAULT_CHUNK_INPUT_TOKENS
 }
 
 /// Build the admin axum [`Router`]. Mounts:
@@ -408,7 +418,12 @@ async fn handle_bootstrap(
     // pollute the project list with throwaway names. Dry-runs can also
     // proceed in parallel with anything else — no mutex needed.
     if req.dry_run {
-        return dry_run_outcome(req.sources, req.max_input_tokens);
+        return dry_run_outcome(
+            req.sources,
+            req.sources_collected,
+            req.max_input_tokens,
+            req.chunk_input_tokens,
+        );
     }
 
     // Live runs from here on need LLM + workspace/project resolution.
@@ -449,6 +464,8 @@ async fn handle_bootstrap(
         workspace_id: ws,
         project_id: proj,
         max_input_tokens: req.max_input_tokens,
+        chunk_input_tokens: req.chunk_input_tokens,
+        sources_collected: req.sources_collected,
         // The individual include_* flags don't matter here: sources
         // are already collected; process_sources ignores them.
         include_git: true,
@@ -500,7 +517,9 @@ fn bootstrap_error_response(
 /// same budget-pruning logic that `Bootstrap::process_sources` would use.
 fn dry_run_outcome(
     sources: Vec<BootstrapSource>,
+    sources_collected: Option<usize>,
     max_input_tokens: usize,
+    chunk_input_tokens: usize,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     use ai_memory_consolidate::BootstrapError;
     if sources.is_empty() {
@@ -511,18 +530,28 @@ fn dry_run_outcome(
             })),
         ));
     }
-    let collected = sources.len();
-    let (kept, dropped, total) = prune_sources_to_budget(sources, max_input_tokens);
+    let incoming = sources.len();
+    let (kept, _dropped, total) = prune_sources_to_budget(sources, max_input_tokens);
+    let collected = sources_collected.unwrap_or(incoming);
+    let sources_sent = kept.len();
+    let sources_dropped = collected.saturating_sub(sources_sent);
     let counts = SourceCounts::from_sources(&kept);
+    let chunk_budget = ai_memory_consolidate::effective_chunk_budget(
+        chunk_input_tokens,
+        max_input_tokens,
+    );
+    let llm_chunks =
+        ai_memory_consolidate::plan_bootstrap_chunks(kept.clone(), chunk_budget).len();
     let outcome = BootstrapOutcome {
         sources_collected: collected,
-        sources_sent: kept.len(),
-        sources_dropped: dropped,
+        sources_sent,
+        sources_dropped,
         sources_by_kind: counts,
         estimated_input_tokens: total,
         pages_written: Vec::new(),
         rationale: "(dry-run; LLM not invoked)".to_string(),
         dry_run: true,
+        llm_chunks,
     };
     Ok((
         StatusCode::OK,

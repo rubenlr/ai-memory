@@ -95,6 +95,36 @@ async fn dry_run_returns_outcome_without_llm() {
     assert_eq!(outcome.pages_written.len(), 0, "dry-run writes no pages");
     assert_eq!(outcome.sources_collected, 3, "three sources were supplied");
     assert!(outcome.sources_sent <= outcome.sources_collected);
+    assert_eq!(outcome.llm_chunks, 1, "small bundle fits one chunk");
+}
+
+/// Client-side pre-prune count is preserved in the outcome.
+#[tokio::test]
+async fn dry_run_honours_sources_collected_hint() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_admin_state(&tmp).await;
+
+    let body = json!({
+        "workspace": "test-ws",
+        "project": "test-proj",
+        "sources": synthetic_sources(),
+        "sources_collected": 9_999,
+        "max_input_tokens": 50_000,
+        "dry_run": true,
+    });
+
+    let resp = post_bootstrap(state, body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let outcome: BootstrapOutcome = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(outcome.sources_collected, 9_999);
+    assert_eq!(
+        outcome.sources_dropped,
+        9_999 - outcome.sources_sent,
+        "dropped must be collected minus sent"
+    );
 }
 
 /// When no LLM is configured and `dry_run=false`, the server returns

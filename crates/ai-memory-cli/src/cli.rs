@@ -190,6 +190,12 @@ pub struct BootstrapArgs {
     /// sensitive or running against a smaller-context provider.
     #[arg(long, default_value_t = 150_000)]
     pub max_input_tokens: usize,
+    /// Max estimated input tokens per LLM call. When pruned sources exceed
+    /// this, bootstrap runs multiple sequential LLM chunks instead of one
+    /// giant prompt (avoids provider context limits / Cursor bridge failures).
+    /// Set to `0` to disable chunking (single call with the full pruned bundle).
+    #[arg(long, default_value_t = ai_memory_consolidate::DEFAULT_CHUNK_INPUT_TOKENS)]
+    pub chunk_input_tokens: usize,
     /// Skip git-commit history ingestion.
     #[arg(long)]
     pub exclude_git: bool,

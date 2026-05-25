@@ -459,7 +459,8 @@ docker run --rm \
 --repo-path <PATH>         (default: git rev-parse --show-toplevel)
 --workspace <NAME>         (default: "default")
 --project <NAME>           (default: "scratch")
---max-input-tokens N       (default: 50000)
+--max-input-tokens N       (default: 150000; total source budget after prune)
+--chunk-input-tokens N     (default: 24000; per LLM call; 0 = single call)
 --since "30 days ago"      (git log filter; supports "N days/months/years ago" + YYYY-MM-DD)
 --exclude-git              (skip commit history)
 --exclude-readme           (skip README)
@@ -493,9 +494,15 @@ docker run --rm -v "$PWD:/repo" ... bootstrap --repo-path /repo --dry-run
   "estimated_input_tokens": 48760,
   "pages_written": [],
   "rationale": "(dry-run; LLM not invoked)",
-  "dry_run": true
+  "dry_run": true,
+  "llm_chunks": 1
 }
 ```
+
+Large repos (e.g. years of git history) are pruned client-side before
+POST, then processed in sequential LLM chunks so provider context limits
+are not exceeded. The CLI logs `llm_chunks` in dry-run and the final
+outcome.
 
 **Caveat: LLM-fabricated detail.** A bootstrap run can produce
 plausible-but-wrong pages (the LLM doesn't know your project, it's

@@ -16,12 +16,11 @@
 //!
 //! ## Cost model
 //!
-//! Input is capped via `max_input_tokens` (default 50k). We
-//! estimate token count locally at chars/4 (the standard rough
-//! heuristic) and drop lower-priority sources first when over
-//! budget. At Kimi's $0.73/$3.49 per M, 50k input ≈ $0.04;
-//! generated output (1-2k tokens) ≈ $0.007. Worst case under
-//! $0.20 per run.
+//! Input is capped via `max_input_tokens` (CLI default 150k). We
+//! estimate token count locally at chars/4 and drop lower-priority
+//! sources first when over budget. Large bundles are split into
+//! sequential LLM chunks (`chunk_input_tokens`, default 24k) so
+//! provider context limits are not exceeded.
 //!
 //! ## Idempotency
 //!
@@ -223,6 +222,9 @@ pub struct BootstrapOutcome {
     pub rationale: String,
     /// True when the operation skipped the LLM call entirely.
     pub dry_run: bool,
+    /// Number of LLM calls made (1 when chunking is off or unnecessary).
+    #[serde(default)]
+    pub llm_chunks: usize,
 }
 
 /// Bootstrap configuration. Built by the CLI from `BootstrapArgs`
@@ -242,6 +244,13 @@ pub struct BootstrapConfig {
     /// Token budget for LLM input; lower-priority sources are
     /// dropped first when over budget.
     pub max_input_tokens: usize,
+    /// Max estimated input tokens per LLM call. When the pruned
+    /// bundle exceeds this, sources are split into sequential chunks
+    /// (each call stays within provider context). `0` disables chunking.
+    pub chunk_input_tokens: usize,
+    /// Original source count before client-side prune (when the CLI
+    /// pre-trims the POST body). `None` → use the incoming vec length.
+    pub sources_collected: Option<usize>,
     /// Include git-commit history.
     pub include_git: bool,
     /// Include `README.md` at the repo root.
@@ -304,41 +313,85 @@ impl Bootstrap {
             return Err(BootstrapError::NoSources);
         }
 
-        let collected = sources.len();
-        let (kept, dropped, est_tokens) = prune_sources_to_budget(sources, cfg.max_input_tokens);
+        let incoming = sources.len();
+        let (kept, _prune_internal, est_tokens) =
+            prune_sources_to_budget(sources, cfg.max_input_tokens);
+        let (collected, sources_sent, sources_dropped) =
+            bootstrap_source_counts(incoming, cfg.sources_collected, &kept);
         info!(
             collected,
-            kept = kept.len(),
-            dropped,
+            sources_sent,
+            sources_dropped,
             est_tokens,
             "bootstrap sources prioritised + budget-capped",
         );
 
         let kept_counts = SourceCounts::from_sources(&kept);
+        let chunk_budget = effective_chunk_budget(cfg.chunk_input_tokens, cfg.max_input_tokens);
 
         // ---- dry run early-exits before the LLM call --------------
         if cfg.dry_run {
             return Ok(BootstrapOutcome {
                 sources_collected: collected,
-                sources_sent: kept.len(),
-                sources_dropped: dropped,
+                sources_sent,
+                sources_dropped,
                 sources_by_kind: kept_counts,
                 estimated_input_tokens: est_tokens,
                 pages_written: Vec::new(),
                 rationale: "(dry-run; LLM not invoked)".to_string(),
                 dry_run: true,
+                llm_chunks: plan_bootstrap_chunks(kept.clone(), chunk_budget).len(),
             });
         }
 
-        // ---- LLM call ---------------------------------------------
-        let request = build_request(&kept);
-        let batch: BootstrapBatch = complete_structured(&*self.llm, request).await?;
+        // ---- LLM call(s) — chunked when over chunk_input_tokens ----
+        let chunks = plan_bootstrap_chunks(kept, chunk_budget);
+        let llm_chunks = chunks.len();
+        info!(
+            llm_chunks,
+            chunk_budget,
+            "bootstrap LLM chunk plan",
+        );
+
+        let mut pages_by_path: std::collections::HashMap<String, BootstrapPage> =
+            std::collections::HashMap::new();
+        let mut rationales = Vec::with_capacity(llm_chunks);
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
+            prior.sort_unstable();
+            let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
+            let request = build_chunk_request(chunk, idx + 1, llm_chunks, &prior_refs);
+            info!(
+                chunk = idx + 1,
+                total = llm_chunks,
+                sources = chunk.len(),
+                est_tokens = chunk.iter().map(BootstrapSource::estimated_tokens).sum::<usize>(),
+                "bootstrap LLM chunk",
+            );
+            let batch: BootstrapBatch = complete_structured(&*self.llm, request).await?;
+            rationales.push(batch.rationale);
+            for page in batch.pages {
+                pages_by_path.insert(page.path.clone(), page);
+            }
+        }
+
+        let mut merged_pages: Vec<BootstrapPage> = pages_by_path.into_values().collect();
+        merged_pages.sort_by(|a, b| a.path.cmp(&b.path));
+        let rationale = if rationales.len() == 1 {
+            rationales.pop().unwrap_or_default()
+        } else {
+            format!(
+                "Processed in {llm_chunks} LLM chunks.\n\n{}",
+                rationales.join("\n\n---\n\n")
+            )
+        };
 
         // ---- write pages ------------------------------------------
         let now = Timestamp::now();
-        let mut requests = Vec::with_capacity(batch.pages.len() + 1);
-        let mut written_paths = Vec::with_capacity(batch.pages.len() + 1);
-        for page in &batch.pages {
+        let mut requests = Vec::with_capacity(merged_pages.len() + 1);
+        let mut written_paths = Vec::with_capacity(merged_pages.len() + 1);
+        for page in &merged_pages {
             let path = match PagePath::new(&page.path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -362,11 +415,12 @@ impl Bootstrap {
         let manifest_body = render_manifest_body(
             now,
             collected,
-            kept.len(),
-            dropped,
+            sources_sent,
+            sources_dropped,
             est_tokens,
-            &batch.rationale,
+            &rationale,
             &written_paths,
+            llm_chunks,
         );
         requests.push(WritePageRequest {
             workspace_id: cfg.workspace_id,
@@ -386,7 +440,7 @@ impl Bootstrap {
 
         let _ids = self.wiki.apply_batch(requests).await?;
         let _ = self.wiki.commit_all(&format!(
-            "bootstrap: ingested {collected} sources, wrote {} pages",
+            "bootstrap: {llm_chunks} LLM chunk(s), ingested {collected} sources, wrote {} pages",
             written_paths.len() + 1,
         ));
 
@@ -396,13 +450,14 @@ impl Bootstrap {
 
         Ok(BootstrapOutcome {
             sources_collected: collected,
-            sources_sent: kept.len(),
-            sources_dropped: dropped,
+            sources_sent,
+            sources_dropped,
             sources_by_kind: kept_counts,
             estimated_input_tokens: est_tokens,
             pages_written: out_paths,
-            rationale: batch.rationale,
+            rationale,
             dry_run: false,
+            llm_chunks,
         })
     }
 
@@ -745,6 +800,81 @@ pub fn prune_sources_to_budget(
     (kept, dropped, total)
 }
 
+/// Default per-chunk input budget when chunking is enabled (~24k tokens
+/// leaves headroom for system prompt + JSON output on Cursor-class providers).
+pub const DEFAULT_CHUNK_INPUT_TOKENS: usize = 24_000;
+
+/// Clamp per-chunk budget to the total input cap. `chunk_input_tokens == 0`
+/// disables chunking (single LLM call).
+#[must_use]
+pub fn effective_chunk_budget(chunk_input_tokens: usize, max_input_tokens: usize) -> usize {
+    if chunk_input_tokens == 0 {
+        0
+    } else {
+        chunk_input_tokens.min(max_input_tokens)
+    }
+}
+
+/// Outcome counters: honour a client-side pre-prune count when supplied.
+fn bootstrap_source_counts(
+    incoming: usize,
+    sources_collected: Option<usize>,
+    kept: &[BootstrapSource],
+) -> (usize, usize, usize) {
+    let collected = sources_collected.unwrap_or(incoming);
+    let sources_sent = kept.len();
+    let sources_dropped = collected.saturating_sub(sources_sent);
+    (collected, sources_sent, sources_dropped)
+}
+
+/// Split pruned sources into LLM-sized chunks. `chunk_budget` of `0` returns
+/// a single chunk containing all sources (legacy one-shot behaviour).
+#[must_use]
+pub fn plan_bootstrap_chunks(
+    sources: Vec<BootstrapSource>,
+    chunk_budget: usize,
+) -> Vec<Vec<BootstrapSource>> {
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    if chunk_budget == 0 {
+        return vec![sources];
+    }
+    let usable = chunk_budget.saturating_sub(1_000);
+    let total: usize = sources.iter().map(BootstrapSource::estimated_tokens).sum();
+    if total <= usable {
+        return vec![sources];
+    }
+    chunk_sources_greedy(sources, usable)
+}
+
+/// Pack sources into chunks ≤ `usable` estimated tokens (best sources first).
+fn chunk_sources_greedy(
+    sources: Vec<BootstrapSource>,
+    usable: usize,
+) -> Vec<Vec<BootstrapSource>> {
+    let mut chunks: Vec<Vec<BootstrapSource>> = Vec::new();
+    let mut current: Vec<BootstrapSource> = Vec::new();
+    let mut current_tokens = 0usize;
+
+    // After prune, low drop_priority (README, rules) sit at the end — process
+    // those first so early chunks carry the highest-signal material.
+    for src in sources.into_iter().rev() {
+        let t = src.estimated_tokens();
+        if !current.is_empty() && current_tokens.saturating_add(t) > usable {
+            chunks.push(current);
+            current = Vec::new();
+            current_tokens = 0;
+        }
+        current_tokens = current_tokens.saturating_add(t);
+        current.push(src);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 // --------------------------------------------------------------------
 // LLM prompt
 // --------------------------------------------------------------------
@@ -753,29 +883,77 @@ pub fn prune_sources_to_budget(
 /// `prompts/bootstrap_system.md`.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/bootstrap_system.md");
 
-fn build_request(sources: &[BootstrapSource]) -> ChatRequest {
+fn build_chunk_request(
+    sources: &[BootstrapSource],
+    chunk_index: usize,
+    chunk_total: usize,
+    prior_paths: &[&str],
+) -> ChatRequest {
     let mut buf = String::with_capacity(8_192);
-    buf.push_str("Sources collected from the project. Convert into wiki pages.\n\n");
+    if chunk_total > 1 {
+        buf.push_str(&format!(
+            "CHUNK {chunk_index} of {chunk_total}. Process ONLY the sources in this message.\n"
+        ));
+        if !prior_paths.is_empty() {
+            buf.push_str(
+                "Wiki pages already produced in earlier chunks (do not duplicate unless \
+                 you are merging new facts into the same path):\n",
+            );
+            for p in prior_paths {
+                buf.push_str(&format!("- `{p}`\n"));
+            }
+            buf.push('\n');
+            let next_adr = next_decision_serial(prior_paths);
+            buf.push_str(&format!(
+                "For new `decisions/` pages, continue numbering at {next_adr:04} \
+                 (e.g. `decisions/{next_adr:04}-<slug>.md`).\n\n"
+            ));
+        }
+        buf.push_str(
+            "Prefer 3-8 substantive pages for this chunk. Skip topics already covered above.\n\n",
+        );
+    } else {
+        buf.push_str("Sources collected from the project. Convert into wiki pages.\n\n");
+    }
     for src in sources {
         buf.push_str(&format!("=== {} ===\n", src.label));
         buf.push_str(&src.text);
         buf.push_str("\n\n");
     }
+    let max_tokens = if chunk_total > 1 {
+        // Each chunk targets a smaller page batch; keeps Cursor bridge responses bounded.
+        16_000
+    } else {
+        64_000
+    };
     ChatRequest {
         system: Some(SYSTEM_PROMPT.into()),
         messages: vec![ChatMessage {
             role: Role::User,
             content: buf,
         }],
-        // Generous budget so the model never runs out mid-response.
-        // Truncated JSON is unrecoverable (no balanced `}`) — better
-        // to over-allocate than to retry. 64K is Haiku/Sonnet 4.5's
-        // max output; smaller hosted models clamp this server-side
-        // to whatever they support, so the constant is safe to leave
-        // generous for the headline providers.
-        max_tokens: 64_000,
+        max_tokens,
         temperature: Some(0.2),
     }
+}
+
+/// Highest `decisions/NNNN-…` serial seen in `prior_paths`, or 0.
+fn next_decision_serial(prior_paths: &[&str]) -> u32 {
+    prior_paths
+        .iter()
+        .filter_map(|p| parse_decision_serial(p))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn parse_decision_serial(path: &str) -> Option<u32> {
+    let rest = path.strip_prefix("decisions/")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 // --------------------------------------------------------------------
@@ -799,6 +977,7 @@ fn render_manifest_body(
     est_tokens: usize,
     rationale: &str,
     pages: &[String],
+    llm_chunks: usize,
 ) -> String {
     let mut buf = String::with_capacity(1024);
     buf.push_str("# Bootstrap manifest\n\n");
@@ -810,7 +989,8 @@ fn render_manifest_body(
         "- Collected: **{sources_collected}**\n\
          - Sent to LLM: **{sources_sent}**\n\
          - Dropped to fit budget: **{sources_dropped}**\n\
-         - Estimated input tokens: **{est_tokens}**\n\n"
+         - Estimated input tokens: **{est_tokens}**\n\
+         - LLM chunks: **{llm_chunks}**\n\n"
     ));
     buf.push_str("## Rationale\n\n");
     buf.push_str(rationale);
@@ -972,5 +1152,71 @@ mod tests {
         let (kept, dropped, _) = prune_sources_to_budget(vec![s1, s2], 50_000);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn plan_chunks_single_when_under_budget() {
+        let s = BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "README".into(),
+            text: "hello".into(),
+        };
+        let chunks = plan_bootstrap_chunks(vec![s], DEFAULT_CHUNK_INPUT_TOKENS);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn plan_chunks_splits_when_over_budget() {
+        let mut sources = Vec::new();
+        for i in 0..8 {
+            sources.push(BootstrapSource {
+                kind: SourceKind::GitCommit,
+                label: format!("git: commit {i}"),
+                text: "x".repeat(12_000),
+            });
+        }
+        let chunks = plan_bootstrap_chunks(sources, 8_000);
+        assert!(chunks.len() > 1, "expected multiple chunks");
+        for chunk in &chunks {
+            let t: usize = chunk.iter().map(BootstrapSource::estimated_tokens).sum();
+            assert!(t <= 8_000, "chunk should respect usable budget");
+        }
+    }
+
+    #[test]
+    fn plan_chunks_zero_disables() {
+        let s = BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "r".into(),
+            text: "x".repeat(100_000),
+        };
+        let chunks = plan_bootstrap_chunks(vec![s], 0);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn source_counts_honour_client_collected_hint() {
+        let kept = vec![BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "README".into(),
+            text: "x".into(),
+        }];
+        let (collected, sent, dropped) = bootstrap_source_counts(1, Some(27_873), &kept);
+        assert_eq!(collected, 27_873);
+        assert_eq!(sent, 1);
+        assert_eq!(dropped, 27_872);
+    }
+
+    #[test]
+    fn effective_chunk_budget_clamps_to_max() {
+        assert_eq!(effective_chunk_budget(50_000, 24_000), 24_000);
+        assert_eq!(effective_chunk_budget(0, 24_000), 0);
+    }
+
+    #[test]
+    fn next_decision_serial_continues_across_chunks() {
+        let paths = ["concepts/foo.md", "decisions/0003-old.md", "decisions/0001-first.md"];
+        assert_eq!(next_decision_serial(&paths), 4);
+        assert_eq!(next_decision_serial(&[]), 1);
     }
 }
