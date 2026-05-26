@@ -35,12 +35,14 @@ cat >"$TMP/sample.toml" <<EOF
 # Comment line
 workspace = "movvia"
 project = "pe-portais"
+project_strategy = "repo-root"
 
 # Trailing comment
 EOF
 
 assert_eq "parse workspace"           "movvia"     "$(ai_memory_parse_toml_key "$TMP/sample.toml" workspace)"
 assert_eq "parse project"             "pe-portais" "$(ai_memory_parse_toml_key "$TMP/sample.toml" project)"
+assert_eq "parse project_strategy"    "repo-root"  "$(ai_memory_parse_toml_key "$TMP/sample.toml" project_strategy)"
 assert_eq "absent key returns empty"  ""           "$(ai_memory_parse_toml_key "$TMP/sample.toml" missing)"
 assert_eq "absent file returns empty" ""           "$(ai_memory_parse_toml_key "$TMP/no-such-file.toml" workspace)"
 
@@ -71,9 +73,9 @@ assert_eq "json_string escapes text" '"quoted \"thing\" \\ path\nnext line"' \
 QS=$(ai_memory_marker_qs "$TMP/a/b/c")
 assert_eq "marker_qs single key" "&cwd=$TMP/a/b/c&workspace=deep" "$QS"
 
-printf 'workspace = "ws1"\nproject = "p1"\n' >"$TMP/a/b/.ai-memory.toml"
+printf 'workspace = "ws1"\nproject = "p1"\nproject_strategy = "repo-root"\n' >"$TMP/a/b/.ai-memory.toml"
 QS2=$(ai_memory_marker_qs "$TMP/a/b/c")
-assert_eq "closer marker wins" "&cwd=$TMP/a/b/c&workspace=ws1&project=p1" "$QS2"
+assert_eq "closer marker wins" "&cwd=$TMP/a/b/c&workspace=ws1&project=p1&project_strategy=repo-root" "$QS2"
 
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> empty qs" "" "$QS3"

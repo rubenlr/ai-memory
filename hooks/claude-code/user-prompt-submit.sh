@@ -2,8 +2,8 @@
 # Claude Code user-prompt hook.
 # Forwards the event JSON to the ai-memory server, fire-and-forget.
 # Walks up from the payload's cwd for a .ai-memory.toml marker file;
-# if found, appends `&workspace=X&project=Y` to the URL so the server
-# routes the event to the declared workspace/project pair instead of
+# if found, appends marker query params to the URL so the server
+# applies the declared workspace/project/strategy instead of
 # bucketing by basename(cwd) under the default workspace.
 # At runtime (after `install-hooks --apply`) `_lib.sh` is staged
 # alongside this script. From the source tree it lives one dir up.

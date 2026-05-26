@@ -582,8 +582,10 @@ function applyMarkerParams(url: URL, cwd: string | undefined): void {{
     const body = readFileSync(marker, "utf8");
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
+    const projectStrategy = tomlKey(body, "project_strategy");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
+    if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   }} catch (_e) {{
   }}
 }}
@@ -869,8 +871,10 @@ function applyMarkerParams(url: URL, cwd: string | undefined): void {{
     const body = readFileSync(marker, "utf8");
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
+    const projectStrategy = tomlKey(body, "project_strategy");
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
+    if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
   }} catch (_e) {{
   }}
 }}
@@ -1531,6 +1535,8 @@ mod tests {
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
         assert!(plugin.contains("text.split(/\\r?\\n/)"));
+        assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
+        assert!(plugin.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
         assert!(plugin.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -1584,6 +1590,8 @@ mod tests {
         assert!(extension.contains("function applyMarkerParams"));
         assert!(extension.contains("readFileSync(marker, \"utf8\")"));
         assert!(extension.contains("text.split(/\\r?\\n/)"));
+        assert!(extension.contains("tomlKey(body, \"project_strategy\")"));
+        assert!(extension.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
         assert!(extension.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));

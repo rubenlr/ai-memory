@@ -60,8 +60,9 @@ priors are at the [bottom](#influences-and-prior-art).
   `<wiki_root>/<workspace_id>/<project_id>/…` keyed by stable UUIDs.
   By default `workspace = "default"` and `project = basename($cwd)`.
   Drop a [`.ai-memory.toml` marker file](docs/marker-file.md) in any
-  ancestor directory to override either — perfect for multi-client
-  consultancies, work/personal split, or mono-repos.
+  ancestor directory to override either or opt into repo-root project
+  identity — perfect for multi-client consultancies, work/personal split,
+  mono-repos, or linked git worktrees.
   Same page path can exist in two projects without collision; a
   rename is one column update; a purge is one `rm -rf`.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
@@ -308,7 +309,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, routing snippet, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, and work/personal separation. |
+| [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, TLS via cloudflared. |

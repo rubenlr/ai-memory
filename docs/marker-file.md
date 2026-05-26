@@ -32,8 +32,9 @@ handoff lookups.
 
 The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP TypeScript integrations. In all cases, hook
-capture and handoff lookup send the same `cwd`, `workspace`, and
-`project` query params to the server when a marker is present.
+capture and handoff lookup send the same `cwd`, `workspace`, `project`,
+and `project_strategy` query params to the server when a marker is
+present.
 
 ## Schema
 
@@ -45,9 +46,15 @@ workspace = "movvia"
 # cwd inside this marker's tree. Omit it to let basename(cwd) drive
 # the project name.
 project = "pe-portais"
+
+# Optional. Omit it to preserve project = basename(cwd). Set it to
+# "repo-root" to derive project from the main git repository root, so
+# linked worktrees and subdirectories share one project. Ignored when
+# `project` is present.
+project_strategy = "repo-root"
 ```
 
-**Naming rules**, validated server-side:
+**Naming rules** for `workspace` and `project`, validated server-side:
 
 - Lowercase ASCII, digits, dots, dashes, underscores
 - Regex: `^[a-z0-9][a-z0-9._-]*$`
@@ -56,7 +63,10 @@ Anything else is rejected at `get_or_create_workspace` / `_project`
 time, surfacing as a hook warning. The shell helper URL-encodes
 defensively but the server's regex is the source of truth.
 
-## Three canonical examples
+`project_strategy` accepts `repo-root` (or `repo_root`) only. Unknown
+values are ignored and behave like the default `basename(cwd)` strategy.
+
+## Four canonical examples
 
 ### Multi-client
 
@@ -86,6 +96,22 @@ Outcome:
 - `~/projects/movvia/pe-portais/apps/web`   → workspace = `movvia`, project = `pe-portais`
   (closer marker wins)
 
+### Git worktrees / repo-root identity
+
+```
+~/projects/ai-memory/.ai-memory.toml → workspace        = "oss"
+                                      → project_strategy = "repo-root"
+```
+
+Outcome:
+
+- `~/projects/ai-memory`                → workspace = `oss`, project = `ai-memory`
+- `~/projects/ai-memory/crates/cli`     → workspace = `oss`, project = `ai-memory`
+- `~/projects/ai-memory-feature-branch` → workspace = `oss`, project = `ai-memory`
+
+Without `project_strategy = "repo-root"`, those same paths keep the
+default behavior and resolve by their current directory basename.
+
 ### Single workspace, no per-repo overrides
 
 ```
@@ -112,6 +138,8 @@ ai-memory rename-project \
 - ❌ No glob patterns. Walk-up by literal ancestry only.
 - ❌ No merge of ancestor markers. Closest wins.
 - ❌ No automatic migration of `default`-workspace projects.
+- ❌ No automatic repo-root collapsing. Worktrees and subdirectories only
+  share a project when `project_strategy = "repo-root"` is explicitly set.
 - ❌ No env / auth / hook-url override. Use the existing env vars
   (`AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_HOOK_URL`) for those.
 
@@ -127,6 +155,7 @@ ai-memory rename-project \
    markers in your tree.
 4. The workspace / project values match the regex above (lowercase
    alphanumerics, dots, dashes, underscores).
+5. If you use `project_strategy`, it is exactly `repo-root`.
 
 Hook scripts run fire-and-forget by design, so they don't log on
 success. To see what's actually being sent, run a hook script by

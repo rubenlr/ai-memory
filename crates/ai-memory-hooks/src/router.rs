@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::log;
-use crate::payload::{HookEnvelope, HookEvent, HookQuery, parse_agent};
+use crate::payload::{HookEnvelope, HookEvent, HookQuery, ProjectStrategy, parse_agent};
 use crate::synth::synthesize_session_page;
 
 /// Default maximum number of hook events allowed to be processing at once.
@@ -41,11 +41,11 @@ use crate::synth::synthesize_session_page;
 /// callers can drop or retry instead of growing memory without bound.
 pub const DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT: usize = 1024;
 
-/// Resolved-project cache: `(cwd, workspace_override, project_override)`
+/// Resolved-project cache: `(cwd, workspace_override, project_override, project_strategy)`
 /// keyed map, shared behind a Tokio mutex so the router can be cloned
 /// freely without losing the in-flight cache hits.
 pub type ProjectCache =
-    Arc<tokio::sync::Mutex<HashMap<(String, String, String), (WorkspaceId, ProjectId)>>>;
+    Arc<tokio::sync::Mutex<HashMap<(String, String, String, String), (WorkspaceId, ProjectId)>>>;
 
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
@@ -69,7 +69,7 @@ pub struct HookState {
     /// the store. Same handle is also held by the wiki and consolidator
     /// so scrubbing happens at every write boundary.
     pub sanitizer: Sanitizer,
-    /// Cache of `(cwd, workspace_override, project_override) → ids`.
+    /// Cache of `(cwd, workspace_override, project_override, project_strategy) → ids`.
     /// The composite key avoids poisoning between callers that resolve
     /// the same `cwd` with and without an override during a hook-script
     /// upgrade window. Each tuple element defaults to the empty string
@@ -129,6 +129,8 @@ pub struct HandoffQuery {
     pub workspace: Option<String>,
     /// Project override (mirror of `HookQuery.project`).
     pub project: Option<String>,
+    /// Project strategy (mirror of `HookQuery.project_strategy`).
+    pub project_strategy: Option<String>,
 }
 
 /// Synchronous endpoint used by `session-start.sh` to discover any
@@ -164,6 +166,7 @@ async fn fetch_and_accept_handoff(
         query.cwd.as_deref(),
         query.workspace.as_deref(),
         query.project.as_deref(),
+        ProjectStrategy::parse(query.project_strategy.as_deref()),
     )
     .await?;
     let handoff = state
@@ -244,10 +247,11 @@ fn render_handoff_markdown(h: &Handoff) -> String {
 /// Precedence:
 /// 1. `workspace_override` (typically declared by the agent's host-side
 ///    hook via a `.ai-memory.toml` walk-up) OR `DEFAULT_WORKSPACE_NAME`.
-/// 2. `project_override` OR `basename(cwd)` OR fallback to
-///    `state.project_id` (when `cwd` is also unavailable).
+/// 2. `project_override` OR marker-selected project strategy OR
+///    `basename(cwd)` OR fallback to `state.project_id` (when `cwd` is
+///    also unavailable).
 ///
-/// Cache key is `(cwd, workspace_override, project_override)` so the
+/// Cache key is `(cwd, workspace_override, project_override, project_strategy)` so the
 /// same `cwd` resolved with and without an override (e.g. during a
 /// hook-script upgrade window) doesn't poison each other's slot.
 async fn resolve_project_ids(
@@ -255,6 +259,7 @@ async fn resolve_project_ids(
     cwd: Option<&str>,
     workspace_override: Option<&str>,
     project_override: Option<&str>,
+    project_strategy: ProjectStrategy,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_norm = cwd.filter(|s| !s.is_empty()).map(str::to_string);
 
@@ -268,6 +273,7 @@ async fn resolve_project_ids(
         cwd_norm.clone().unwrap_or_default(),
         workspace_override.unwrap_or("").to_string(),
         project_override.unwrap_or("").to_string(),
+        project_strategy.as_str().to_string(),
     );
 
     {
@@ -285,34 +291,17 @@ async fn resolve_project_ids(
         .unwrap_or(DEFAULT_WORKSPACE_NAME)
         .to_string();
 
-    let project_name = match (project_override, cwd_norm.as_deref()) {
-        (Some(p), _) => p.to_string(),
-        (None, Some(c)) => {
-            let path = std::path::Path::new(c);
-            // Resolve git repo root first — handles worktrees by following
-            // the .git gitdir pointer back to the main repository.
-            match ai_memory_consolidate::discover_main_repo_root(path)
-                .ok()
-                .and_then(|root| {
-                    root.file_name()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                })
-                .or_else(|| {
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                        .filter(|s| !s.is_empty())
-                }) {
-                Some(name) => name,
-                None => {
-                    state
-                        .active_project
-                        .set(state.workspace_id, state.project_id);
-                    return Ok((state.workspace_id, state.project_id));
-                }
+    let (project_name, repo_path) = match (project_override, cwd_norm.as_deref()) {
+        (Some(p), _) => (p.to_string(), cwd_norm.clone()),
+        (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
+            Some(resolved) => resolved,
+            None => {
+                state
+                    .active_project
+                    .set(state.workspace_id, state.project_id);
+                return Ok((state.workspace_id, state.project_id));
             }
-        }
+        },
         (None, None) => {
             // The early-return at the top of the function guards
             // against this branch; the explicit fallback here keeps
@@ -327,6 +316,27 @@ async fn resolve_project_ids(
         }
     };
 
+    fn derive_project_from_cwd(
+        cwd: &str,
+        strategy: ProjectStrategy,
+    ) -> Option<(String, Option<String>)> {
+        let path = std::path::Path::new(cwd);
+        if matches!(strategy, ProjectStrategy::RepoRoot)
+            && let Ok(root) = ai_memory_consolidate::discover_main_repo_root(path)
+            && let Some(name) = basename(&root)
+        {
+            return Some((name, Some(root.to_string_lossy().into_owned())));
+        }
+        basename(path).map(|name| (name, Some(cwd.to_string())))
+    }
+
+    fn basename(path: &std::path::Path) -> Option<String> {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    }
+
     let ws = state
         .writer
         .get_or_create_workspace(workspace_name)
@@ -334,7 +344,7 @@ async fn resolve_project_ids(
         .map_err(|e| anyhow::anyhow!("get_or_create_workspace: {e}"))?;
     let proj = state
         .writer
-        .get_or_create_project(ws, project_name, cwd_norm.clone())
+        .get_or_create_project(ws, project_name, repo_path)
         .await
         .map_err(|e| anyhow::anyhow!("get_or_create_project: {e}"))?;
     let ids = (ws, proj);
@@ -356,6 +366,7 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
         env.cwd.as_deref(),
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
+        env.project_strategy,
     )
     .await?;
 
@@ -677,6 +688,21 @@ mod tests {
         }
     }
 
+    fn init_repo_with_commit(path: &std::path::Path) -> git2::Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = git2::Repository::init(path).unwrap();
+        let sig = repo
+            .signature()
+            .unwrap_or_else(|_| git2::Signature::now("test", "test@test.com").unwrap());
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        {
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+                .unwrap();
+        }
+        repo
+    }
+
     /// Two hook events with distinct cwds must land in two distinct projects.
     #[tokio::test]
     async fn process_with_cwd_creates_new_project() {
@@ -684,15 +710,25 @@ mod tests {
         let state = make_state(&tmp).await;
 
         // Event from /home/user/project-alpha.
-        let (ws_a, proj_a) =
-            resolve_project_ids(&state, Some("/home/user/project-alpha"), None, None)
-                .await
-                .unwrap();
+        let (ws_a, proj_a) = resolve_project_ids(
+            &state,
+            Some("/home/user/project-alpha"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
         // Event from /home/user/project-beta.
-        let (ws_b, proj_b) =
-            resolve_project_ids(&state, Some("/home/user/project-beta"), None, None)
-                .await
-                .unwrap();
+        let (ws_b, proj_b) = resolve_project_ids(
+            &state,
+            Some("/home/user/project-beta"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
 
         // Projects must be distinct; workspace is the same (`default`).
         assert_ne!(proj_a, proj_b, "different cwds → different projects");
@@ -734,14 +770,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws, proj) = resolve_project_ids(&state, None, None, None).await.unwrap();
+        let (ws, proj) = resolve_project_ids(&state, None, None, None, ProjectStrategy::Basename)
+            .await
+            .unwrap();
         assert_eq!(ws, state.workspace_id);
         assert_eq!(proj, state.project_id);
 
         // Likewise for an empty string.
-        let (ws2, proj2) = resolve_project_ids(&state, Some(""), None, None)
-            .await
-            .unwrap();
+        let (ws2, proj2) =
+            resolve_project_ids(&state, Some(""), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
         assert_eq!(ws2, state.workspace_id);
         assert_eq!(proj2, state.project_id);
 
@@ -756,9 +795,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws, proj) = resolve_project_ids(&state, Some("/"), None, None)
-            .await
-            .unwrap();
+        let (ws, proj) =
+            resolve_project_ids(&state, Some("/"), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
         assert_eq!(ws, state.workspace_id);
         assert_eq!(proj, state.project_id);
         assert_eq!(state.active_project.get(), Some((ws, proj)));
@@ -791,25 +831,32 @@ mod tests {
         let cwd = "/home/user/cached-project";
 
         // First call — populates the cache.
-        let (_, proj_first) = resolve_project_ids(&state, Some(cwd), None, None)
-            .await
-            .unwrap();
+        let (_, proj_first) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
 
         // Inspect the cache: should have exactly one entry.
         {
             let cache = state.project_cache.lock().await;
             assert_eq!(cache.len(), 1, "cache has one entry after first call");
-            let key = (cwd.to_string(), String::new(), String::new());
+            let key = (
+                cwd.to_string(),
+                String::new(),
+                String::new(),
+                ProjectStrategy::Basename.as_str().to_string(),
+            );
             assert!(
                 cache.contains_key(&key),
-                "cache keyed by (cwd, ws_override, proj_override)"
+                "cache keyed by (cwd, ws_override, proj_override, project_strategy)"
             );
         }
 
         // Second call — must return the same IDs from the cache.
-        let (_, proj_second) = resolve_project_ids(&state, Some(cwd), None, None)
-            .await
-            .unwrap();
+        let (_, proj_second) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
         assert_eq!(proj_first, proj_second, "cache must return identical IDs");
 
         // Cache must still have exactly one entry (no duplicate insert).
@@ -843,10 +890,15 @@ mod tests {
 
         // The observation must be in the project derived from the cwd,
         // not in the server-default `scratch` project.
-        let (_, expected_proj) =
-            resolve_project_ids(&state, Some("/home/user/my-project"), None, None)
-                .await
-                .unwrap();
+        let (_, expected_proj) = resolve_project_ids(
+            &state,
+            Some("/home/user/my-project"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
         assert_ne!(
             expected_proj, state.project_id,
             "routing must not use server-default project"
@@ -974,13 +1026,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws_default, _) = resolve_project_ids(&state, Some("/home/u/repo"), None, None)
-            .await
-            .unwrap();
-        let (ws_movvia, _) =
-            resolve_project_ids(&state, Some("/home/u/repo"), Some("movvia"), None)
-                .await
-                .unwrap();
+        let (ws_default, _) = resolve_project_ids(
+            &state,
+            Some("/home/u/repo"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
+        let (ws_movvia, _) = resolve_project_ids(
+            &state,
+            Some("/home/u/repo"),
+            Some("movvia"),
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
 
         assert_ne!(
             ws_default, ws_movvia,
@@ -994,9 +1057,15 @@ mod tests {
         let state = make_state(&tmp).await;
         let cwd = "/home/u/repo";
 
-        let (ws, proj) = resolve_project_ids(&state, Some(cwd), Some("acme"), None)
-            .await
-            .unwrap();
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            Some("acme"),
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
         state
             .writer
             .insert_handoff(NewHandoff {
@@ -1021,6 +1090,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
                 project: None,
+                project_strategy: None,
             },
         )
         .await
@@ -1039,13 +1109,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (_, proj_basename) = resolve_project_ids(&state, Some("/home/u/api"), None, None)
-            .await
-            .unwrap();
-        let (_, proj_override) =
-            resolve_project_ids(&state, Some("/home/u/api"), None, Some("pe-portais"))
-                .await
-                .unwrap();
+        let (_, proj_basename) = resolve_project_ids(
+            &state,
+            Some("/home/u/api"),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
+        let (_, proj_override) = resolve_project_ids(
+            &state,
+            Some("/home/u/api"),
+            None,
+            Some("pe-portais"),
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
 
         assert_ne!(
             proj_basename, proj_override,
@@ -1061,12 +1142,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws_a, proj_a) = resolve_project_ids(&state, Some("/x"), Some("acme"), Some("api"))
-            .await
-            .unwrap();
-        let (ws_b, proj_b) = resolve_project_ids(&state, Some("/y"), Some("acme"), Some("api"))
-            .await
-            .unwrap();
+        let (ws_a, proj_a) = resolve_project_ids(
+            &state,
+            Some("/x"),
+            Some("acme"),
+            Some("api"),
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
+        let (ws_b, proj_b) = resolve_project_ids(
+            &state,
+            Some("/y"),
+            Some("acme"),
+            Some("api"),
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ws_a, ws_b);
         assert_eq!(proj_a, proj_b);
@@ -1082,12 +1175,19 @@ mod tests {
         let state = make_state(&tmp).await;
         let cwd = "/home/u/poison-test";
 
-        let (ws_default, _) = resolve_project_ids(&state, Some(cwd), None, None)
-            .await
-            .unwrap();
-        let (ws_movvia, _) = resolve_project_ids(&state, Some(cwd), Some("movvia"), None)
-            .await
-            .unwrap();
+        let (ws_default, _) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+        let (ws_movvia, _) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            Some("movvia"),
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
 
         assert_ne!(
             ws_default, ws_movvia,
@@ -1110,16 +1210,147 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
 
-        let (ws, proj) = resolve_project_ids(&state, None, Some("acme"), Some("api"))
-            .await
-            .unwrap();
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            None,
+            Some("acme"),
+            Some("api"),
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
 
         assert_ne!(ws, state.workspace_id);
         assert_ne!(proj, state.project_id);
     }
 
+    #[test]
+    fn unknown_project_strategy_defaults_to_basename() {
+        assert_eq!(
+            ProjectStrategy::parse(Some("repo-root")),
+            ProjectStrategy::RepoRoot
+        );
+        assert_eq!(
+            ProjectStrategy::parse(Some("repo_root")),
+            ProjectStrategy::RepoRoot
+        );
+        assert_eq!(
+            ProjectStrategy::parse(Some("git-root")),
+            ProjectStrategy::Basename
+        );
+    }
+
+    #[tokio::test]
+    async fn default_strategy_keeps_git_subdirs_as_basename_projects() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let main_dir = tmp.path().join("my-project");
+        init_repo_with_commit(&main_dir);
+        let app_dir = main_dir.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_cwd = app_dir.to_str().unwrap();
+
+        let (_, proj_basename) =
+            resolve_project_ids(&state, Some(app_cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+        let (_, proj_explicit_app) = resolve_project_ids(
+            &state,
+            Some(main_dir.to_str().unwrap()),
+            None,
+            Some("app"),
+            ProjectStrategy::RepoRoot,
+        )
+        .await
+        .unwrap();
+        let (_, proj_repo_root) =
+            resolve_project_ids(&state, Some(app_cwd), None, None, ProjectStrategy::RepoRoot)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            proj_basename, proj_explicit_app,
+            "default strategy must keep project = basename(cwd) inside git repos"
+        );
+        assert_ne!(
+            proj_basename, proj_repo_root,
+            "repo-root strategy is opt-in and must not affect the basename default"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_override_wins_over_repo_root_strategy() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let main_dir = tmp.path().join("repo");
+        init_repo_with_commit(&main_dir);
+        let app_dir = main_dir.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_cwd = app_dir.to_str().unwrap();
+
+        let (_, proj_repo_root) =
+            resolve_project_ids(&state, Some(app_cwd), None, None, ProjectStrategy::RepoRoot)
+                .await
+                .unwrap();
+        let (_, proj_override_repo_root) = resolve_project_ids(
+            &state,
+            Some(app_cwd),
+            None,
+            Some("manual"),
+            ProjectStrategy::RepoRoot,
+        )
+        .await
+        .unwrap();
+        let (_, proj_override_basename) = resolve_project_ids(
+            &state,
+            Some(app_cwd),
+            None,
+            Some("manual"),
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proj_override_repo_root, proj_override_basename);
+        assert_ne!(
+            proj_override_repo_root, proj_repo_root,
+            "explicit project override must beat repo-root derivation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_does_not_poison_across_project_strategies() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        let main_dir = tmp.path().join("repo");
+        init_repo_with_commit(&main_dir);
+        let app_dir = main_dir.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let app_cwd = app_dir.to_str().unwrap();
+
+        let (_, proj_basename) =
+            resolve_project_ids(&state, Some(app_cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+        let (_, proj_repo_root) =
+            resolve_project_ids(&state, Some(app_cwd), None, None, ProjectStrategy::RepoRoot)
+                .await
+                .unwrap();
+
+        assert_ne!(proj_basename, proj_repo_root);
+        let cache = state.project_cache.lock().await;
+        assert_eq!(
+            cache.len(),
+            2,
+            "same cwd must have isolated cache entries per project strategy"
+        );
+    }
+
     /// A git worktree must resolve to the same project as the main
-    /// working directory — both share the same repository identity.
+    /// working directory only when the marker opts into repo-root identity.
     #[tokio::test]
     async fn worktree_resolves_to_same_project_as_main_repo() {
         let tmp = TempDir::new().unwrap();
@@ -1127,17 +1358,7 @@ mod tests {
 
         // Create a real git repo inside the temp dir.
         let main_dir = tmp.path().join("my-project");
-        std::fs::create_dir_all(&main_dir).unwrap();
-        let repo = git2::Repository::init(&main_dir).unwrap();
-
-        // git2 requires at least one commit before creating a worktree.
-        let sig = repo
-            .signature()
-            .unwrap_or_else(|_| git2::Signature::now("test", "test@test.com").unwrap());
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
-            .unwrap();
+        let repo = init_repo_with_commit(&main_dir);
 
         // Create a worktree in a sibling directory.
         let wt_dir = tmp.path().join("my-project-feature-branch");
@@ -1154,17 +1375,33 @@ mod tests {
         let main_cwd = main_dir.to_str().unwrap();
         let wt_cwd = wt_dir.to_str().unwrap();
 
-        let (ws_main, proj_main) = resolve_project_ids(&state, Some(main_cwd), None, None)
-            .await
-            .unwrap();
-        let (ws_wt, proj_wt) = resolve_project_ids(&state, Some(wt_cwd), None, None)
-            .await
-            .unwrap();
+        let (ws_main, proj_main) = resolve_project_ids(
+            &state,
+            Some(main_cwd),
+            None,
+            None,
+            ProjectStrategy::RepoRoot,
+        )
+        .await
+        .unwrap();
+        let (ws_wt, proj_wt) =
+            resolve_project_ids(&state, Some(wt_cwd), None, None, ProjectStrategy::RepoRoot)
+                .await
+                .unwrap();
 
         assert_eq!(ws_main, ws_wt, "same workspace");
         assert_eq!(
             proj_main, proj_wt,
             "worktree must resolve to same project as main repo"
+        );
+
+        let (_, proj_wt_basename) =
+            resolve_project_ids(&state, Some(wt_cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
+        assert_ne!(
+            proj_main, proj_wt_basename,
+            "default strategy must not collapse worktrees into the main repo project"
         );
     }
 
@@ -1180,9 +1417,10 @@ mod tests {
         std::fs::create_dir_all(&plain_dir).unwrap();
         let cwd = plain_dir.to_str().unwrap();
 
-        let (_, proj) = resolve_project_ids(&state, Some(cwd), None, None)
-            .await
-            .unwrap();
+        let (_, proj) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
 
         // Must NOT be the server-default scratch project.
         assert_ne!(proj, state.project_id);
@@ -1191,9 +1429,15 @@ mod tests {
         // they produce distinct projects (basename-based).
         let other_dir = tmp.path().join("other-project");
         std::fs::create_dir_all(&other_dir).unwrap();
-        let (_, proj2) = resolve_project_ids(&state, Some(other_dir.to_str().unwrap()), None, None)
-            .await
-            .unwrap();
+        let (_, proj2) = resolve_project_ids(
+            &state,
+            Some(other_dir.to_str().unwrap()),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
         assert_ne!(proj, proj2, "different basenames → different projects");
     }
 
@@ -1208,9 +1452,10 @@ mod tests {
         git2::Repository::init_bare(&bare_dir).unwrap();
         let cwd = bare_dir.to_str().unwrap();
 
-        let (_, proj) = resolve_project_ids(&state, Some(cwd), None, None)
-            .await
-            .unwrap();
+        let (_, proj) =
+            resolve_project_ids(&state, Some(cwd), None, None, ProjectStrategy::Basename)
+                .await
+                .unwrap();
 
         // Must NOT be the server-default scratch project — basename should work.
         assert_ne!(proj, state.project_id);
@@ -1219,9 +1464,15 @@ mod tests {
         // To verify: resolve with a different bare repo name and confirm different project.
         let bare_dir2 = tmp.path().join("other-bare.git");
         git2::Repository::init_bare(&bare_dir2).unwrap();
-        let (_, proj2) = resolve_project_ids(&state, Some(bare_dir2.to_str().unwrap()), None, None)
-            .await
-            .unwrap();
+        let (_, proj2) = resolve_project_ids(
+            &state,
+            Some(bare_dir2.to_str().unwrap()),
+            None,
+            None,
+            ProjectStrategy::Basename,
+        )
+        .await
+        .unwrap();
         assert_ne!(
             proj, proj2,
             "different bare repo basenames → different projects"

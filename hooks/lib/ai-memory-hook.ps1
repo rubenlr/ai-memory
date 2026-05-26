@@ -43,6 +43,8 @@ function Get-AiMemoryMarkerQuery {
     if ($ws) { $qs += "&workspace=$([uri]::EscapeDataString($ws))" }
     $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
     if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
+    $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
+    if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
     return $qs
 }
 

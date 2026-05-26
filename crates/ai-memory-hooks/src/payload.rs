@@ -22,6 +22,10 @@ pub struct HookQuery {
     /// Project name override (same source as `workspace`). When
     /// `None` the server falls back to `basename(cwd)`.
     pub project: Option<String>,
+    /// Optional project derivation strategy from `.ai-memory.toml`.
+    /// `repo-root` makes the server derive project identity from the
+    /// main git repository root instead of `basename(cwd)`.
+    pub project_strategy: Option<String>,
     /// Optional third-party extension namespace. When present, ai-memory
     /// preserves a validated source event name without expanding the
     /// closed core event vocabulary.
@@ -52,6 +56,8 @@ pub struct HookEnvelope {
     /// Project name override declared by the hook. Empty / `None`
     /// defers to `basename(cwd)`.
     pub project_override: Option<String>,
+    /// Project derivation strategy declared by the hook marker.
+    pub project_strategy: ProjectStrategy,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
@@ -62,6 +68,39 @@ pub struct HookEnvelope {
     pub body_excerpt: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
+}
+
+/// How the hook router derives a project name when no explicit
+/// `project` override is present.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectStrategy {
+    /// Preserve v1 behavior: `project = basename(cwd)`.
+    #[default]
+    Basename,
+    /// Opt-in marker behavior: `project = basename(main git repo root)`.
+    RepoRoot,
+}
+
+impl ProjectStrategy {
+    /// Parse a query-string marker value. Unknown values are ignored so a
+    /// typo cannot route sessions into surprising new buckets.
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("repo-root" | "repo_root") => Self::RepoRoot,
+            _ => Self::Basename,
+        }
+    }
+
+    /// Stable cache-key representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Basename => "basename",
+            Self::RepoRoot => "repo-root",
+        }
+    }
 }
 
 /// Discriminator for the lifecycle event that triggered the hook.
@@ -199,6 +238,7 @@ impl HookEnvelope {
         let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
+        let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
             let raw_source = query
@@ -229,6 +269,7 @@ impl HookEnvelope {
             cwd,
             workspace_override,
             project_override,
+            project_strategy,
             extension,
             source_event,
             title_hint,
@@ -549,6 +590,20 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn envelope_parses_project_strategy_query() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                project_strategy: Some("repo-root".into()),
+                ..Default::default()
+            },
+            serde_json::json!({}),
+        );
+
+        assert_eq!(env.project_strategy, ProjectStrategy::RepoRoot);
     }
 
     /// Antigravity CLI identifies the conversation as `conversationId`

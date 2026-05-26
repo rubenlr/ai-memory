@@ -68,7 +68,8 @@ ai_memory_url_encode() {
 # Build a query-string suffix from the marker file walked up from "$1".
 # Returns the suffix (with the leading `&`) or nothing. `cwd` is included
 # whenever a marker exists so `GET /handoff` can resolve workspace-only
-# markers by combining `workspace` with basename(cwd).
+# markers by combining `workspace` with basename(cwd), or apply an opt-in
+# project strategy.
 ai_memory_marker_qs() {
     cwd="$1"
     [ -z "$cwd" ] && return 0
@@ -76,9 +77,11 @@ ai_memory_marker_qs() {
     [ -z "$marker" ] && return 0
     ws=$(ai_memory_parse_toml_key "$marker" workspace)
     pr=$(ai_memory_parse_toml_key "$marker" project)
+    st=$(ai_memory_parse_toml_key "$marker" project_strategy)
     qs="&cwd=$(ai_memory_url_encode "$cwd")"
     [ -n "$ws" ] && qs="${qs}&workspace=$(ai_memory_url_encode "$ws")"
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
+    [ -n "$st" ] && qs="${qs}&project_strategy=$(ai_memory_url_encode "$st")"
     printf '%s' "$qs"
 }
 

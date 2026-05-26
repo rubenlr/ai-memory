@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workspace` (required) and `project` (optional) without depending on
   `basename($cwd)`. Lifecycle hook scripts walk up from `cwd` to find
   the closest marker and forward `cwd` plus the declared names as
-  query params on `POST /hook` and `GET /handoff`. Server accepts the
-  new params as optional overrides;
+  query params on `POST /hook` and `GET /handoff`. Markers can also set
+  `project_strategy = "repo-root"` to derive project identity from the
+  main git repository root, so linked worktrees share one project. Server
+  accepts the new params as optional overrides;
   absent marker means the previous behaviour (`workspace = "default"`,
   `project = basename(cwd)`) — fully backward compatible. See
   [`docs/marker-file.md`](docs/marker-file.md).
