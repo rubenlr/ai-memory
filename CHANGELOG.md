@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `_slots/*.md` pages can now declare `slot_kind: state` or
+  `slot_kind: invariant` frontmatter. `state` remains the default for existing
+  slots; `invariant` marks high-resistance project context or preferences that
+  consolidation should not rewrite unless observations directly contradict the
+  existing slot content.
+
+### Fixed
+- Page upserts now treat frontmatter/title/tier/pinned changes as real page
+  updates instead of short-circuiting solely on unchanged body text, keeping the
+  SQLite index consistent with markdown frontmatter-only edits.
+
 ## [0.6.1] - 2026-05-28
 
 ### Added
