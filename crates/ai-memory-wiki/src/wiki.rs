@@ -241,10 +241,17 @@ impl Wiki {
         }
         let abs = self.abs_path(workspace_id, project_id, path);
         match std::fs::remove_file(&abs) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::WikiError::Io(e)),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(crate::WikiError::Io(e)),
         }
+        // The watcher only reconciles create/modify events, not deletions, so
+        // drop the derived index rows here — otherwise the page lingers in
+        // search/recent with stale content after its file is gone.
+        self.writer
+            .delete_page(workspace_id, project_id, path.clone())
+            .await?;
+        Ok(())
     }
 
     /// Purge a whole project's wiki directory. When an admission chain is

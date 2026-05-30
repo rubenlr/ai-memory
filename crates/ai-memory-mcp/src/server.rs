@@ -2053,6 +2053,28 @@ mod tests {
             }))
             .await;
         assert!(read.is_err(), "deleted page must not be readable");
+
+        // Regression: the derived index row must also be gone — the watcher
+        // does not reconcile deletions, so a file-only delete would leave the
+        // page surfacing in recent/search with stale content.
+        let recent = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(10),
+                project: None,
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let recent_text = recent
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !recent_text.contains("notes/temp.md"),
+            "deleted page must not linger in the index; got {recent_text}"
+        );
     }
 
     /// `memory_handoff_begin` must resolve the same project as
