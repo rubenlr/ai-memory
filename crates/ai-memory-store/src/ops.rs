@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, ObservationId,
-    ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    AgentKind, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
+    ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -294,35 +294,84 @@ fn replace_links_in_tx(
     )?;
 
     let mut seen = BTreeSet::new();
-    for to_path in &page.links {
-        if !seen.insert(to_path.as_str().to_string()) {
+    for link in &page.links {
+        let key = (
+            link.workspace.clone(),
+            link.project.clone(),
+            link.path.as_str().to_string(),
+        );
+        if !seen.insert(key) {
             continue;
         }
-        let to_page_id = latest_page_id_for_path(tx, page, to_path)?;
+        let to_page_id = latest_page_id_for_link(tx, page, link)?;
         let to_page_blob = to_page_id.as_ref().map(|id| &id.as_bytes()[..]);
         tx.execute(
-            "INSERT INTO links (from_page_id, to_page_id, to_path, link_type) \
-             VALUES (?1, ?2, ?3, 'references')",
-            params![from_page_id.as_bytes(), to_page_blob, to_path.as_str()],
+            "INSERT INTO links \
+                 (from_page_id, to_page_id, to_workspace, to_project, to_path, link_type) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'references')",
+            params![
+                from_page_id.as_bytes(),
+                to_page_blob,
+                link.workspace,
+                link.project,
+                link.path.as_str(),
+            ],
         )?;
     }
     Ok(())
 }
 
-fn latest_page_id_for_path(
+/// Resolve a link target to the latest page id it points at, or `None` if the
+/// target workspace / project / page does not exist yet (an unresolved forward
+/// link). A bare link resolves within the source page's own project; a
+/// `[[project:path]]` / `[[workspace/project:path]]` link resolves against the
+/// named project (same workspace when only the project is given).
+fn latest_page_id_for_link(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
-    to_path: &PagePath,
+    link: &LinkTarget,
 ) -> StoreResult<Option<PageId>> {
+    let (workspace_blob, project_blob): (Vec<u8>, Vec<u8>) = match &link.project {
+        None => (
+            page.workspace_id.as_bytes().to_vec(),
+            page.project_id.as_bytes().to_vec(),
+        ),
+        Some(project_name) => {
+            let workspace_blob: Vec<u8> = match &link.workspace {
+                None => page.workspace_id.as_bytes().to_vec(),
+                Some(workspace_name) => {
+                    let found: Option<Vec<u8>> = tx
+                        .query_row(
+                            "SELECT id FROM workspaces WHERE name = ?1",
+                            params![workspace_name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match found {
+                        Some(id) => id,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            let project_blob: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT id FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    params![workspace_blob, project_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match project_blob {
+                Some(id) => (workspace_blob, id),
+                None => return Ok(None),
+            }
+        }
+    };
+
     let bytes: Option<Vec<u8>> = tx
         .query_row(
             "SELECT id FROM pages \
              WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
-            params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
-                to_path.as_str(),
-            ],
+            params![workspace_blob, project_blob, link.path.as_str()],
             |row| row.get(0),
         )
         .optional()?;
@@ -336,10 +385,13 @@ fn refresh_incoming_links_for_path(
     page: &NewPage,
     latest_page_id: &PageId,
 ) -> StoreResult<()> {
+    // (1) Bare (same-project) links: from_page lives in this page's project and
+    // the target carries no scope. Repoints all matches (not only unresolved):
+    // a new page version changes the latest id, so resolved links must follow.
     tx.execute(
         "UPDATE links \
          SET to_page_id = ?1 \
-         WHERE to_path = ?2 \
+         WHERE to_project IS NULL AND to_path = ?2 \
            AND EXISTS ( \
                SELECT 1 FROM pages from_page \
                WHERE from_page.id = links.from_page_id \
@@ -353,6 +405,48 @@ fn refresh_incoming_links_for_path(
             page.project_id.as_bytes(),
         ],
     )?;
+
+    // (2) Cross-project links naming this page's project by name. `to_workspace`
+    // may be explicit (cross-workspace) or NULL (same workspace as the source).
+    let project_name: Option<String> = tx
+        .query_row(
+            "SELECT name FROM projects WHERE id = ?1",
+            params![page.project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let workspace_name: Option<String> = tx
+        .query_row(
+            "SELECT name FROM workspaces WHERE id = ?1",
+            params![page.workspace_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let (Some(project_name), Some(workspace_name)) = (project_name, workspace_name) {
+        tx.execute(
+            "UPDATE links \
+             SET to_page_id = ?1 \
+             WHERE to_project = ?2 AND to_path = ?3 \
+               AND ( \
+                   to_workspace = ?4 \
+                   OR ( \
+                       to_workspace IS NULL \
+                       AND EXISTS ( \
+                           SELECT 1 FROM pages from_page \
+                           WHERE from_page.id = links.from_page_id \
+                             AND from_page.workspace_id = ?5 \
+                       ) \
+                   ) \
+               )",
+            params![
+                latest_page_id.as_bytes(),
+                project_name,
+                page.path.as_str(),
+                workspace_name,
+                page.workspace_id.as_bytes(),
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -939,7 +1033,7 @@ mod tests {
     //! deserve direct coverage so a regression surfaces with a
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
-    use ai_memory_core::{NewHandoff, NewPage, NewSession, PagePath, Tier};
+    use ai_memory_core::{LinkTarget, NewHandoff, NewPage, NewSession, PagePath, Tier};
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -1098,7 +1192,7 @@ mod tests {
     fn upsert_page_persists_and_resolves_links() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let mut source = page(ws, proj, "concepts/source.md", "see target");
-        source.links = vec![PagePath::new("decisions/target.md").unwrap()];
+        source.links = vec![PagePath::new("decisions/target.md").unwrap().into()];
         let source_id = upsert_page(&mut conn, &source).unwrap();
 
         let unresolved: i64 = conn
@@ -1125,6 +1219,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolved.as_deref(), Some(&target_id.as_bytes()[..]));
+    }
+
+    /// A `[[infra:runbooks/02.md]]` link from one project resolves to a page
+    /// in a sibling project once that page exists — the cross-project edge.
+    #[test]
+    fn upsert_page_resolves_cross_project_link() {
+        let (_tmp, mut conn, ws, scratch) = fresh_db();
+        let infra = get_or_create_project(&mut conn, &ws, "infra", None).unwrap();
+
+        let mut source = page(ws, scratch, "concepts/dep.md", "depends on infra runbook");
+        source.links = vec![LinkTarget {
+            workspace: None,
+            project: Some("infra".into()),
+            path: PagePath::new("runbooks/02.md").unwrap(),
+        }];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+
+        // Persisted with the scope, unresolved until the target project's page exists.
+        let (to_project, resolved): (Option<String>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT to_project, to_page_id FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "runbooks/02.md"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(to_project.as_deref(), Some("infra"));
+        assert!(
+            resolved.is_none(),
+            "cross-project link is unresolved before the target exists"
+        );
+
+        // Create the target in `infra` → the forward link repoints across projects.
+        let target_id =
+            upsert_page(&mut conn, &page(ws, infra, "runbooks/02.md", "the runbook")).unwrap();
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "runbooks/02.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some(&target_id.as_bytes()[..]),
+            "link must resolve across projects once the target lands"
+        );
     }
 
     /// Handoff state machine: insert → Open; accept_handoff → Accepted

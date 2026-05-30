@@ -52,9 +52,53 @@ pub struct NewPage {
     pub pinned: bool,
     /// Outgoing links discovered in the page body.
     ///
-    /// The store resolves these against the latest page rows in the same
-    /// project and keeps unresolved forward links as `to_page_id = NULL`.
-    pub links: Vec<PagePath>,
+    /// The store resolves these against the latest page rows in the target
+    /// project (the source's own project for bare links, or the named
+    /// project for a cross-project `[[project:path]]` link) and keeps
+    /// unresolved forward links as `to_page_id = NULL`.
+    pub links: Vec<LinkTarget>,
+}
+
+/// A link target discovered in a page body.
+///
+/// A bare `[[path]]` / `[label](path)` resolves within the source page's
+/// own project (`workspace`/`project` both `None`). A `[[project:path]]`
+/// link names a sibling project in the same workspace; a
+/// `[[workspace/project:path]]` link crosses workspaces. Making
+/// cross-project dependencies explicit edges is what turns the per-project
+/// wikis into one graph.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LinkTarget {
+    /// Cross-workspace qualifier. `None` = same workspace as the source.
+    pub workspace: Option<String>,
+    /// Cross-project qualifier. `None` = same project as the source.
+    pub project: Option<String>,
+    /// Wiki path within the target project (root-relative).
+    pub path: PagePath,
+}
+
+impl LinkTarget {
+    /// A link resolving within the source page's own project.
+    #[must_use]
+    pub fn local(path: PagePath) -> Self {
+        Self {
+            workspace: None,
+            project: None,
+            path,
+        }
+    }
+
+    /// Whether this link names a different project than its source.
+    #[must_use]
+    pub fn is_cross_project(&self) -> bool {
+        self.project.is_some()
+    }
+}
+
+impl From<PagePath> for LinkTarget {
+    fn from(path: PagePath) -> Self {
+        Self::local(path)
+    }
 }
 
 /// Materialised view of a page row.

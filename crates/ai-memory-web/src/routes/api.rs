@@ -54,6 +54,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             "/workspaces/{workspace}/projects/{project}/overview",
             axum::routing::get(project_overview_handler),
         )
+        .route("/graph", axum::routing::get(graph_handler))
         .with_state(state)
 }
 
@@ -87,6 +88,23 @@ async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Respon
         .map_err(internal_error)?;
     Ok(with_cache(
         Json(workspaces).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
+/// Cross-project dependency graph: every resolved link whose endpoints are
+/// in different projects, each carrying both endpoints' workspace/project/
+/// path. The UI builds nodes from the endpoints (and may aggregate to a
+/// project-level dependency graph). Global for now; project scoping is a
+/// follow-up query param.
+async fn graph_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
+    let edges = state
+        .reader
+        .cross_project_edges(None)
+        .await
+        .map_err(internal_error)?;
+    Ok(with_cache(
+        Json(serde_json::json!({ "edges": edges })).into_response(),
         LIST_CACHE_MAX_AGE,
     ))
 }

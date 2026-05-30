@@ -89,7 +89,7 @@ id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 /// Always uses `/` as the separator (POSIX-style), normalised on construction.
 /// Never starts with a slash; never contains `..` or `.` components. This
 /// invariant lets the store treat paths as flat keys without re-validating.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PagePath(String);
 

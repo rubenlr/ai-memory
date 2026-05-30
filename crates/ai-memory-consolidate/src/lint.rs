@@ -107,6 +107,38 @@ pub async fn run_lint(
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let mut findings = rule_based_findings(&candidates);
 
+    // Dangling cross-project links: a `[[project:path]]` dependency that does
+    // not resolve. A broken inter-project edge is high-signal — surface it
+    // even on the zero-LLM path.
+    for dangling in reader
+        .dangling_cross_project_links(workspace_id, project_id)
+        .await?
+    {
+        let target = match &dangling.workspace {
+            Some(ws) => format!("{ws}/{}:{}", dangling.project, dangling.path),
+            None => format!("{}:{}", dangling.project, dangling.path),
+        };
+        let message = if dangling.project_exists {
+            format!(
+                "Page {} links to {} but that page does not exist in project `{}` \
+                 (missing, renamed, or deleted) — a broken cross-project dependency",
+                dangling.from_path, target, dangling.project,
+            )
+        } else {
+            format!(
+                "Page {} links to {} but project `{}` does not exist (typo or wrong name)",
+                dangling.from_path, target, dangling.project,
+            )
+        };
+        findings.push(LintFinding {
+            kind: "broken_link".into(),
+            severity: "warning".into(),
+            message,
+            pages: vec![dangling.from_path],
+            detail: None,
+        });
+    }
+
     if use_llm && let Some(provider) = llm {
         match contradiction_pass(
             provider.clone(),

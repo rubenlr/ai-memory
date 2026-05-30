@@ -27,6 +27,6 @@ pub use ids::{
     AgentKind, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
-pub use page::{NewPage, Page, Tier};
+pub use page::{LinkTarget, NewPage, Page, Tier};
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, full_block};
 pub use sanitize::{SanitizeConfig, Sanitized, Sanitizer};
