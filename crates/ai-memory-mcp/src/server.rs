@@ -46,7 +46,10 @@ the conversation calls for them:\n\
 \n\
 - `memory_query` — when the user references prior work you don't \
   recognise, or asks 'have we done / discussed X', or you're about \
-  to propose architecture (always check first).\n\
+  to propose architecture (always check first). Defaults to the \
+  current project; pass `scopes` to search named sibling projects, \
+  or `global=true` to search EVERY project at once when you don't \
+  know where the knowledge lives.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
@@ -90,6 +93,18 @@ the conversation calls for them:\n\
   filename hints; you then use your own Write/Edit tool to land it \
   in the right rules file (Claude Code → CLAUDE.md, Codex / \
   OpenCode / Cursor / Gemini → AGENTS.md).\n\
+\n\
+**When the current project comes up empty, broaden — don't stop.** \
+`memory_query` searches only ONE project (the current one); there is \
+NO global 'search everything' mode. If a query returns nothing useful, \
+the knowledge may live in a SIBLING project — shared `infra`, `ops`, \
+or a related app. Re-run `memory_query` with explicit \
+`scopes: [{workspace, project}]` naming those projects; don't conclude \
+'we never recorded it' after one project misses. Note also that \
+`memory_query` returns SNIPPETS, not full page bodies — an empty or \
+short snippet does NOT mean the page is empty (a large page can match \
+outside the snippet window); to read the whole page use \
+`memory_read_page` (by `path`, or a `query` for the top hit's body).\n\
 \n\
 The routing snippet this very text comes from can also be installed \
 into the project's CLAUDE.md / AGENTS.md so the guidance survives \
@@ -170,6 +185,13 @@ struct QueryArgs {
     /// knowledge. Cannot be combined with `workspace`/`project`.
     #[serde(default)]
     scopes: Vec<MemoryScopeArg>,
+    /// Search EVERY project in every workspace in one call (cross-project
+    /// global search). Use when you don't know which project holds the
+    /// knowledge — e.g. shared infra/ops notes. When true, omit
+    /// `project`/`workspace`/`scopes`; each hit is annotated with its
+    /// workspace + project so you can tell where it came from.
+    #[serde(default)]
+    global: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -209,6 +231,10 @@ struct MemoryQueryResponse {
     hits: Vec<ai_memory_store::PageHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     raw_hits: Vec<ai_memory_store::ObservationHit>,
+    /// Populated only by a `global=true` query: cross-project hits, each
+    /// carrying its workspace + project name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    global_hits: Vec<ai_memory_store::PageHitWithMeta>,
 }
 
 #[derive(Debug, Serialize)]
@@ -668,12 +694,42 @@ impl AiMemoryServer {
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
         If compiled wiki search misses, `raw_hits` contains bounded raw \
-        observation fallback matches.")]
+        observation fallback matches. Set `global=true` to search EVERY \
+        project at once (cross-project) when you don't know which project \
+        holds the knowledge — each hit then carries its workspace + \
+        project name.")]
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        if args.global.unwrap_or(false) {
+            if !args.scopes.is_empty()
+                || args
+                    .workspace
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                || args
+                    .project
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
+            {
+                return Err(McpError::internal_error(
+                    "global cannot be combined with workspace/project/scopes",
+                    None,
+                ));
+            }
+            let global_hits = self
+                .reader
+                .search_pages_with_meta(args.query.clone(), limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return ok_json(&MemoryQueryResponse {
+                hits: Vec::new(),
+                raw_hits: Vec::new(),
+                global_hits,
+            });
+        }
         if !args.scopes.is_empty()
             && (args
                 .workspace
@@ -741,7 +797,11 @@ impl AiMemoryServer {
         } else {
             Vec::new()
         };
-        let response = MemoryQueryResponse { hits, raw_hits };
+        let response = MemoryQueryResponse {
+            hits,
+            raw_hits,
+            global_hits: Vec::new(),
+        };
         ok_json(&response)
     }
 
@@ -1471,6 +1531,28 @@ mod tests {
     }
 
     #[test]
+    fn prompts_teach_cross_project_search_strategy() {
+        // Regression: a single-project miss must not read as "never recorded".
+        // Both surfaces must point the agent at `scopes` and warn that query
+        // returns snippets, not full page bodies. (Learned the hard way when
+        // cluster-access info lived in a sibling `infra` project.)
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            assert!(
+                prompt.contains("scopes"),
+                "prompt must teach broadening the search via `scopes`"
+            );
+            assert!(
+                prompt.contains("sibling") || prompt.contains("SIBLING"),
+                "prompt must mention knowledge can live in a sibling project"
+            );
+            assert!(
+                prompt.contains("snippet"),
+                "prompt must warn that query returns snippets, not full bodies"
+            );
+        }
+    }
+
+    #[test]
     fn prompts_route_permanent_annotations_to_write_page_not_handoff() {
         for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
             assert!(
@@ -1538,6 +1620,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await
             .unwrap();
@@ -1586,6 +1669,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await
             .unwrap();
@@ -1640,6 +1724,7 @@ mod tests {
                 project: Some("unit-testing".into()),
                 scopes: Vec::new(),
                 workspace: Some("practice".into()),
+                global: None,
             }))
             .await
             .unwrap();
@@ -1737,6 +1822,7 @@ mod tests {
                     },
                 ],
                 workspace: None,
+                global: None,
             }))
             .await
             .unwrap();
@@ -1752,6 +1838,93 @@ mod tests {
             "expected practice hit: {text}"
         );
         assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_global_searches_all_projects() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let other = store
+            .writer
+            .get_or_create_project(ws, "infra", None)
+            .await
+            .unwrap();
+        let other_ws = store.writer.get_or_create_workspace("ops").await.unwrap();
+        let third = store
+            .writer
+            .get_or_create_project(other_ws, "runbooks", None)
+            .await
+            .unwrap();
+        for (w, p, path, body) in [
+            (ws, other, "cluster.md", "global_token lives in infra"),
+            (
+                other_ws,
+                third,
+                "deploy.md",
+                "global_token lives in ops runbooks",
+            ),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: w,
+                    project_id: p,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let result = server
+            .memory_query(Parameters(QueryArgs {
+                query: "global_token".into(),
+                limit: Some(10),
+                project: None,
+                scopes: Vec::new(),
+                workspace: None,
+                global: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        // Both projects (across two workspaces) surface in one global call,
+        // each annotated with its project name.
+        assert!(text.contains("cluster.md"), "expected infra hit: {text}");
+        assert!(text.contains("deploy.md"), "expected ops hit: {text}");
+        assert!(
+            text.contains("infra"),
+            "hit must carry project name: {text}"
+        );
+        assert!(text.contains("global_hits"), "global hits field: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_global_rejects_explicit_scope() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_query(Parameters(QueryArgs {
+                query: "x".into(),
+                limit: Some(5),
+                project: Some("product".into()),
+                scopes: Vec::new(),
+                workspace: None,
+                global: Some(true),
+            }))
+            .await;
+        assert!(
+            err.is_err(),
+            "global must not combine with project/workspace/scopes"
+        );
     }
 
     #[tokio::test]
@@ -2299,6 +2472,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await
             .expect("oversized limit should be clamped, not refused");
@@ -2326,6 +2500,7 @@ mod tests {
                 project: None,
                 scopes: Vec::new(),
                 workspace: None,
+                global: None,
             }))
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or
