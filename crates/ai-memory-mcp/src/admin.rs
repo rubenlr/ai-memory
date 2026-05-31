@@ -1881,9 +1881,12 @@ async fn handle_move_project(
                 // Preserve the stored title verbatim (PageSummary.title is
                 // the DB-derived title), rather than re-deriving it.
                 title: Some(s.title.clone()),
+                // None → the write_page admission chain resolves the
+                // workspace/project NAMES from the destination IDs, so the
+                // git-mirror lands the copy under the destination path.
+                admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
-                admission_ctx: None,
             })
             .await
         {
@@ -1944,15 +1947,30 @@ async fn handle_move_project(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Remove the source's on-disk dir (mirrors handle_purge_project). DB
-    // cascade already deleted the rows; dir removal is best-effort.
-    let proj_root = state.wiki.project_root(src_ws, src_proj);
-    let proj_root_str = proj_root.display().to_string();
+    // Remove the source's on-disk dir through Wiki::purge_project so the
+    // admission chain is notified (op=purge_project) before removal — a
+    // git-mirror drops its copy of the source project. The DB rows were
+    // just deleted above, so name-resolution would find nothing; pass the
+    // workspace/project NAMES explicitly (mirrors handle_purge_project).
+    let purge_ctx = AdmissionContext {
+        workspace: req.from_workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeProject,
+        ..Default::default()
+    };
+    let proj_root_str = state
+        .wiki
+        .project_root(src_ws, src_proj)
+        .display()
+        .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match std::fs::remove_dir_all(&proj_root) {
+    match state
+        .wiki
+        .purge_project(src_ws, src_proj, Some(purge_ctx))
+        .await
+    {
         Ok(()) => files_deleted.push(proj_root_str),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
             files_failed.push(proj_root_str);
