@@ -3390,6 +3390,15 @@ mod tests {
                     "body": "body"
                 }),
             ),
+            (
+                "POST",
+                "/admin/delete-page",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "path": "notes/x.md"
+                }),
+            ),
         ];
 
         for (method, uri, payload) in routes {
