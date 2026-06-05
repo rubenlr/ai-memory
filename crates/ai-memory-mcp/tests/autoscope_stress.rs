@@ -819,6 +819,46 @@ async fn sustained_per_session_isolation_holds_under_continuous_traffic() {
         .unwrap_or(5);
     let duration = Duration::from_secs(duration_secs);
 
+    // Prime each session once and wait until its own keyed slot is visible.
+    // The sustained loop below intentionally does not sleep between hook and
+    // read, but without this initial barrier op #0 can race before the first
+    // asynchronous hook processor has ever published that session's entry and
+    // legitimately fall back to the global compatibility slot.
+    for i in 1..=SESSIONS {
+        let session = format!("sustained-sess-{i}");
+        let resp = h
+            .router
+            .clone()
+            .oneshot(hook_request(None, &session, i))
+            .await
+            .expect("initial sustained hook oneshot");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let _ = response_body_text(resp).await;
+
+        let own = number_word(i);
+        let mut settled = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let resp = h
+                .router
+                .clone()
+                .oneshot(mcp_query_request(None, Some(&session)))
+                .await
+                .expect("initial sustained read oneshot");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let text = extract_tool_text(&response_body_text(resp).await);
+            if text.contains(own) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "session {session} did not publish its initial {own:?} marker before stress loop"
+        );
+    }
+
     // One driver task per session, all running concurrently. Each
     // returns its op count + the first cross-actor leak it observed
     // (None means clean).
