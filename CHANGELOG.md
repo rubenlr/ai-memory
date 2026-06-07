@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- New `ai-memory hook` subcommand emits one lifecycle event natively (reads
+  the JSON payload from stdin, POSTs to `/hook`, GETs `/handoff` on
+  `session-start`) without spawning a shell. On native Windows, Claude Code
+  now defaults to the native hook command — measured ~3.5-5× faster per
+  tool-call hook (~735 ms shell → ~150-205 ms native on an i7-6700HQ).
+  Opt back into the previous Git Bash + `.sh` path with
+  `AI_MEMORY_HOOK_PLATFORM=windows-bash`. See
+  [`docs/windows.md`](docs/windows.md#native-hook-command-claude-code-on-windows)
+  ([#84]).
+- New `GET /favicon.ico` route on the web UI serves the same logo bytes as
+  the header, so the browser tab carries an icon without an extra asset
+  embed ([#79]).
+- Thin-client CLI commands (`status`, `write-page`, `search`, `read-page`,
+  `embed`, `lint`, `backup`, …) now respect the server's base-path mount
+  via `AI_MEMORY_BASE_PATH` or the path component of `AI_MEMORY_SERVER_URL`
+  (URL path wins), so deployments hosted behind a reverse proxy under a
+  subpath stop 404'ing — including the container `HEALTHCHECK`
+  (`ai-memory status`). Empty / unset means root mount, byte-identical to
+  the prior behaviour ([#82]).
+
+### Changed
+- The embedded web UI ships a single transparent 768×768 PNG (~126 KB,
+  down from a 992 KB JPEG mislabelled as PNG) used for both the header
+  logo and the favicon. README branding stays on the existing
+  light/dark pair via `<picture>` ([#79]).
+
+### Fixed
+- `install-hooks --apply` (and `ai-memory upgrade`, which calls it) now
+  MERGES into per-event hook arrays instead of replacing them, so
+  third-party hooks registered under the same event (e.g. a context-mode
+  `SessionStart` guard) survive re-apply. ai-memory-owned entries are
+  still swapped for the fresh ones; re-runs stay idempotent. Resolves
+  #80 ([#83]).
+- FTS5 searches for filenames carrying ASCII punctuation no longer error
+  or silently miss. `current.md` (which used to surface
+  `fts5: syntax error near "."`) and `ui-refresh` (which silently returned
+  zero hits despite `follow-ups/ui-refresh-scroll-restoration.md` existing)
+  both work end-to-end. Punctuated tokens are now quoted as both
+  whole-form and split-form phrases, OR'd, to satisfy the asymmetry
+  between the content tokenizer (`tokenchars '/_-'` keeps them inside
+  tokens) and the path index (which pre-expands `/_-.` to spaces)
+  ([#81]).
 
 ## [0.11.0] - 2026-06-05
 ### Added
