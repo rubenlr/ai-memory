@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- The hook router no longer auto-creates fragment "projects" for
+  subdirectory cwds. When a tool call's cwd sits inside an existing
+  project's `repo_path` tree (for example a `Read` of
+  `manga-plus/reader/src/main.rs` while the session is attributed to
+  `manga-plus`), the resolver now picks the existing parent project
+  instead of materialising a `src` or `reader` project for the
+  subdirectory name. The schema column `projects.repo_path` has
+  always been there for exactly this kind of cwd matching; the
+  resolver finally queries it. Sub-projects declared via
+  `.ai-memory.toml` still win because their longer `repo_path` ranks
+  ahead. New `find_project_by_cwd_prefix` reader helper covers the
+  query. Three regression tests in `ai-memory-hooks::router::tests`
+  pin the parent / sub-project / cold-start paths.
+- V19 data-repair migration re-attributes pre-existing orphan
+  observations and handoffs to their session's project, then deletes
+  the now-truly-empty fragment project rows that were left behind
+  by the bug above. The session is the source of truth — observations
+  belong to the session that emitted them and the FK enforces
+  session existence. The migration is idempotent (re-running on a
+  repaired DB is a no-op) and runs once per data directory at server
+  startup via the existing refinery chain. `scratch` is explicitly
+  preserved per CLAUDE.md invariant #15a (defensive cwd-less
+  default).
 
 ## [0.12.1] - 2026-06-07
 ### Fixed
