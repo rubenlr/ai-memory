@@ -376,20 +376,7 @@ impl Wiki {
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
-        let pinned = is_slot_path(&path)
-            || md
-                .frontmatter
-                .get("pinned")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        // Derive tier from the restored frontmatter (same fix as reindex_page):
-        // hardcoding Semantic here would flip an episodic page's tier on restore.
-        let tier = md
-            .frontmatter
-            .get("tier")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<Tier>().ok())
-            .unwrap_or(Tier::Semantic);
+        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -775,24 +762,9 @@ impl Wiki {
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
-        // Derive tier/pinned from the on-disk frontmatter instead of hardcoding
-        // Semantic/is_slot_path. The watcher calls reindex_page on every page
-        // every ~30s; hardcoding clobbered episodic session pages to semantic
-        // (so they never decayed) and dropped the frontmatter `pinned` flag,
-        // also churning a spurious page version per write. Mirrors the pinned
-        // derivation already used by restore_page_from_checkpoint, plus tier.
-        let pinned = is_slot_path(&path)
-            || md
-                .frontmatter
-                .get("pinned")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        let tier = md
-            .frontmatter
-            .get("tier")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<Tier>().ok())
-            .unwrap_or(Tier::Semantic);
+        // Markdown is the source of truth: preserve explicit tier/pinned
+        // metadata on reindex instead of forcing every page back to semantic.
+        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -1019,6 +991,15 @@ impl Wiki {
 
             markdown.body = self.sanitizer.scrub(&markdown.body);
             scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
+            req.pinned = req.pinned
+                || is_slot_path(&req.path)
+                || markdown
+                    .frontmatter
+                    .get("pinned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            markdown.frontmatter =
+                canonicalize_index_frontmatter(markdown.frontmatter, req.tier, req.pinned);
 
             let title = req
                 .title
@@ -1070,7 +1051,7 @@ impl Wiki {
                     body: req.body.clone(),
                     tier: req.tier,
                     frontmatter_json: req.frontmatter.clone(),
-                    pinned: req.pinned || is_slot_path(&req.path),
+                    pinned: req.pinned,
                     links: extract_links(&req.body, &req.path),
                     author_id: req.author_id,
                 })
@@ -1147,7 +1128,7 @@ impl Wiki {
         // tool slips through.
         let body = self.sanitizer.scrub(&body);
 
-        let pinned = pinned || is_slot_path(&path);
+        let mut pinned = pinned || is_slot_path(&path);
         // Multi-user attribution (P1.6): stamp `last_modified_by` into the
         // frontmatter BEFORE building the markdown, so both the admission
         // chain and the on-disk file see the resolved author. Rung 0
@@ -1179,6 +1160,13 @@ impl Wiki {
         // cannot reintroduce secrets after the caller body was sanitized.
         markdown.body = self.sanitizer.scrub(&markdown.body);
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
+        pinned = pinned
+            || markdown
+                .frontmatter
+                .get("pinned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        markdown.frontmatter = canonicalize_index_frontmatter(markdown.frontmatter, tier, pinned);
 
         // Re-derive title + links from the (possibly mutated) markdown.
         // We do this after the chain so explicit title overrides survive
@@ -1325,6 +1313,55 @@ pub struct WritePageRequest {
 
 fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
     crate::WikiError::Io(std::io::Error::other(msg.to_string()))
+}
+
+fn derive_index_metadata(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<(Tier, bool)> {
+    let tier = match frontmatter.get("tier") {
+        None => Tier::Semantic,
+        Some(serde_json::Value::String(s)) => s.parse::<Tier>().map_err(|e| {
+            ai_memory_wiki_error(&format!(
+                "invalid tier in frontmatter for {}: {e}",
+                path.as_str()
+            ))
+        })?,
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-string tier in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    let pinned = is_slot_path(path)
+        || frontmatter
+            .get("pinned")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    Ok((tier, pinned))
+}
+
+fn canonicalize_index_frontmatter(
+    frontmatter: serde_json::Value,
+    tier: Tier,
+    pinned: bool,
+) -> serde_json::Value {
+    let mut obj = match frontmatter {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => return other,
+    };
+    obj.insert(
+        "tier".to_string(),
+        serde_json::Value::String(tier.as_str().to_string()),
+    );
+    if pinned {
+        obj.insert("pinned".to_string(), serde_json::Value::Bool(true));
+    } else if obj.get("pinned").and_then(|v| v.as_bool()) == Some(true) {
+        obj.remove("pinned");
+    }
+    serde_json::Value::Object(obj)
 }
 
 fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult<String> {
@@ -1778,7 +1815,11 @@ mod tests {
         let path = PagePath::new("sessions/abc.md").unwrap();
         let abs = wiki.abs_path(ws, proj, &path);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-        std::fs::write(&abs, "---\ntitle: S\ntier: episodic\npinned: true\n---\nbody").unwrap();
+        std::fs::write(
+            &abs,
+            "---\ntitle: S\ntier: episodic\npinned: true\n---\nbody",
+        )
+        .unwrap();
 
         let id1 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
         let meta = store
@@ -1816,6 +1857,129 @@ mod tests {
             pmeta.tier, "semantic",
             "a page without a frontmatter tier must default to semantic"
         );
+
+        let invalid = PagePath::new("notes/bad-tier.md").unwrap();
+        let iabs = wiki.abs_path(ws, proj, &invalid);
+        std::fs::write(&iabs, "---\ntitle: Bad\ntier: episdoic\n---\nbody").unwrap();
+        assert!(
+            wiki.reindex_page(ws, proj, invalid).await.is_err(),
+            "malformed tier frontmatter must fail closed instead of silently becoming semantic"
+        );
+
+        let non_string = PagePath::new("notes/non-string-tier.md").unwrap();
+        let ns_abs = wiki.abs_path(ws, proj, &non_string);
+        std::fs::write(&ns_abs, "---\ntitle: Bad\ntier: 7\n---\nbody").unwrap();
+        assert!(
+            wiki.reindex_page(ws, proj, non_string).await.is_err(),
+            "non-string tier frontmatter must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_paths_persist_index_metadata_for_reindex_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+
+        let path = PagePath::new("notes/episodic.md").unwrap();
+        let mut request = req(
+            ws,
+            proj,
+            path.as_str(),
+            "episodic body",
+            serde_json::json!({"title": "Episodic"}),
+        );
+        request.tier = Tier::Episodic;
+        request.pinned = true;
+        let id = wiki.write_page(request).await.unwrap();
+
+        let md = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(md.frontmatter["tier"], "episodic");
+        assert_eq!(md.frontmatter["pinned"], true);
+        let id2 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        assert_eq!(id, id2, "write then reindex should be idempotent");
+        let meta = store
+            .reader
+            .page_meta("default", "scratch", path.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.tier, "episodic");
+        assert!(meta.pinned);
+
+        let batch_path = PagePath::new("notes/procedural.md").unwrap();
+        let mut batch_req = req(
+            ws,
+            proj,
+            batch_path.as_str(),
+            "procedure body",
+            serde_json::json!({"title": "Procedure"}),
+        );
+        batch_req.tier = Tier::Procedural;
+        wiki.apply_batch(vec![batch_req]).await.unwrap();
+        let md = wiki.read_page(ws, proj, &batch_path).unwrap();
+        assert_eq!(md.frontmatter["tier"], "procedural");
+        wiki.reindex_page(ws, proj, batch_path.clone())
+            .await
+            .unwrap();
+        let meta = store
+            .reader
+            .page_meta("default", "scratch", batch_path.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.tier, "procedural");
+        assert!(!meta.pinned);
+
+        let frontmatter_pinned_path = PagePath::new("notes/frontmatter-pinned.md").unwrap();
+        let mut frontmatter_pinned_req = req(
+            ws,
+            proj,
+            frontmatter_pinned_path.as_str(),
+            "frontmatter pinned body",
+            serde_json::json!({"title": "Frontmatter Pinned", "pinned": true}),
+        );
+        frontmatter_pinned_req.pinned = false;
+        wiki.write_page(frontmatter_pinned_req).await.unwrap();
+        wiki.reindex_page(ws, proj, frontmatter_pinned_path.clone())
+            .await
+            .unwrap();
+        let meta = store
+            .reader
+            .page_meta("default", "scratch", frontmatter_pinned_path.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(meta.pinned);
+    }
+
+    #[tokio::test]
+    async fn restore_page_from_checkpoint_preserves_frontmatter_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/restored.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            &abs,
+            "---\ntitle: Restored\ntier: episodic\npinned: true\n---\nold",
+        )
+        .unwrap();
+        let rev = wiki.commit_all("checkpoint").unwrap().unwrap().to_string();
+        std::fs::write(&abs, "---\ntitle: Restored\ntier: semantic\n---\nnew").unwrap();
+
+        wiki.restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
+            .await
+            .unwrap();
+        let meta = store
+            .reader
+            .page_meta("default", "scratch", path.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.tier, "episodic");
+        assert!(meta.pinned);
+        let md = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(md.body.trim(), "old");
     }
 
     #[tokio::test]
@@ -2812,10 +2976,9 @@ mod tests {
         let _ = meta;
     }
 
-    /// Backward-compat: anonymous writes leave frontmatter and
-    /// author_id untouched.
+    /// Backward-compat: anonymous writes do not add attribution frontmatter.
     #[tokio::test]
-    async fn write_page_with_anonymous_actor_leaves_frontmatter_unchanged() {
+    async fn write_page_with_anonymous_actor_omits_attribution_frontmatter() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
