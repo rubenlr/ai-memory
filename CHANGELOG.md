@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside the binary in the release tarball (the probe derived a bogus
   `/private/hooks/…`), so the binary-sibling `hooks/` directory is now on the
   discovery search path and `--source` is no longer required.
+- Wiki reindex and checkpoint restore now preserve page `tier` and `pinned`
+  metadata from frontmatter instead of forcing every reindexed page back to
+  semantic/unpinned. Wiki writes now serialize canonical tier/pinned metadata so
+  later watcher reconciliation remains idempotent for episodic and pinned pages.
 
 ### Added
 - `GET /admin/audit-contamination` (and `ai-memory audit-contamination`) — a
