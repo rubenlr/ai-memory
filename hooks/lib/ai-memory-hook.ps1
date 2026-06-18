@@ -46,6 +46,24 @@ function Get-AiMemoryTomlKey {
     return $null
 }
 
+# Resolve the basename of the MAIN git repository root for $Cwd, following the
+# worktree commondir pointer so every linked worktree collapses to one stable
+# name. Mirrors the POSIX `ai_memory_repo_root_project`: a containerized server
+# cannot see the host checkout, so repo-root must be resolved here. Returns
+# $null when git is unavailable or $Cwd is not inside a git work tree.
+function Get-AiMemoryRepoRootProject {
+    param([string] $Cwd)
+    if (-not $Cwd) { return $null }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
+    $inside = (& git -C $Cwd rev-parse --is-inside-work-tree 2>$null)
+    if ($inside -ne "true") { return $null }
+    $common = (& git -C $Cwd rev-parse --path-format=absolute --git-common-dir 2>$null)
+    if (-not $common) { return $null }
+    $root = Split-Path $common -Parent
+    if (-not $root -or $root -eq [System.IO.Path]::GetPathRoot($root)) { return $null }
+    return Split-Path $root -Leaf
+}
+
 function Get-AiMemoryMarkerQuery {
     param([string] $Cwd)
     if (-not $Cwd) { return "" }
@@ -55,8 +73,13 @@ function Get-AiMemoryMarkerQuery {
     $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
     if ($ws) { $qs += "&workspace=$([uri]::EscapeDataString($ws))" }
     $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
-    if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
     $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
+    # repo-root must be resolved host-side (the server may not see this checkout);
+    # only when no explicit project is pinned. Explicit project always wins.
+    if (-not $proj -and ($strategy -eq "repo-root" -or $strategy -eq "repo_root")) {
+        $proj = Get-AiMemoryRepoRootProject -Cwd $Cwd
+    }
+    if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
     return $qs
 }

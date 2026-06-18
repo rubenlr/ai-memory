@@ -65,6 +65,34 @@ ai_memory_url_encode() {
         | sed 's/%/%25/g; s/+/%2B/g; s/&/%26/g; s/=/%3D/g; s/?/%3F/g; s/#/%23/g; s/ /%20/g'
 }
 
+# Resolve the basename of the MAIN git repository root for "$1" (a cwd),
+# following the worktree commondir pointer so every linked worktree of a
+# repo collapses to one stable name. Mirrors the server's
+# `discover_main_repo_root` (libgit2) but runs host-side, where the
+# checkout is always visible — the server cannot do this when it runs in a
+# container that has no access to the host filesystem (its own discovery
+# fails and falls back to basename(cwd), so out-of-tree worktrees each
+# became their own project). Prints the name, or nothing when cwd is not
+# inside a git work tree (caller keeps its basename(cwd) fallback).
+ai_memory_repo_root_project() {
+    cwd="$1"
+    [ -z "$cwd" ] && return 0
+    command -v git >/dev/null 2>&1 || return 0
+    # Only touch git when cwd is genuinely inside a working tree. Outside any
+    # repo, or inside a bare repo, `--is-inside-work-tree` is not "true" and
+    # we stay silent rather than guess.
+    [ "$(git -C "$cwd" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ] || return 0
+    # `--git-common-dir` is the shared `.git` dir: for a worktree it points
+    # at the MAIN repo's `.git`, so its parent is always the main repo root.
+    common=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+    [ -n "$common" ] || return 0
+    root=$(dirname "$common")
+    case "$root" in
+        "" | /) return 0 ;;
+    esac
+    basename "$root"
+}
+
 # Build a query-string suffix from "$1" plus any marker file walked up from
 # it. Returns the suffix with the leading `&`, or nothing when cwd is absent.
 # `cwd` is always included so `GET /handoff` resolves the same basename project
@@ -78,6 +106,17 @@ ai_memory_marker_qs() {
     ws=$(ai_memory_parse_toml_key "$marker" workspace)
     pr=$(ai_memory_parse_toml_key "$marker" project)
     st=$(ai_memory_parse_toml_key "$marker" project_strategy)
+    # The repo-root strategy must be resolved here, on the host: a containerized
+    # server cannot see this checkout, so its own libgit2 discovery fails and
+    # falls back to basename(cwd). When the marker selects repo-root and pins no
+    # explicit project, derive the main repo name now and send it as an explicit
+    # `project` override. `project_strategy` is still forwarded so native servers
+    # keep their existing resolution path.
+    if [ -z "$pr" ]; then
+        case "$st" in
+            repo-root | repo_root) pr=$(ai_memory_repo_root_project "$cwd") ;;
+        esac
+    fi
     [ -n "$ws" ] && qs="${qs}&workspace=$(ai_memory_url_encode "$ws")"
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
     [ -n "$st" ] && qs="${qs}&project_strategy=$(ai_memory_url_encode "$st")"

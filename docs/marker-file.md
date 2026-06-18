@@ -113,6 +113,16 @@ Outcome:
 Without `project_strategy = "repo-root"`, those same paths keep the
 default behavior and resolve by their current directory basename.
 
+Resolution is host-side: the lifecycle hook follows the worktree's
+commondir pointer (`git rev-parse --git-common-dir`) to the main
+repository and sends the resolved name as an explicit `project`. This
+means it works even when the worktree directory lives **outside** the
+main repo tree (some tools keep worktrees in a separate directory, so
+the worktree has no `.ai-memory.toml` ancestor of its own) and even when
+the server runs in a container that cannot see the host checkout. Put
+the marker anywhere on the walk-up path from the worktree — commonly a
+single `~/.ai-memory.toml` — to select the strategy.
+
 ### Single workspace, no per-repo overrides
 
 ```

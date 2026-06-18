@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `project_strategy = "repo-root"` no longer falls back to `basename(cwd)` for
+  git worktrees whose directory lives outside the main repo tree when the server
+  runs in a container. The server resolves repo-root via libgit2 on the incoming
+  `cwd`, which fails when that host path is not visible inside the container, so
+  every such worktree became its own project. The POSIX shell hooks (and the
+  PowerShell hook) now resolve the main repo root host-side — following the
+  worktree commondir pointer with `git rev-parse --git-common-dir` — and send it
+  as an explicit `project`, so linked worktrees collapse to one stable project
+  regardless of where the worktree directory lives or how the server is
+  deployed. git is only touched when `cwd` is inside a real work tree. (issue #110)
 - Unscoped MCP queries could resolve to the wrong project on a shared
   install. The cwd-to-project resolver recorded the bare working directory
   as a project's `repo_path` whenever the cwd was not inside a git repo

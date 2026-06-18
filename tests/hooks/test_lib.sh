@@ -80,6 +80,52 @@ assert_eq "closer marker wins" "&cwd=$TMP/a/b/c&workspace=ws1&project=p1&project
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$TMP/nonexistent" "$QS3"
 
+# --- repo-root strategy: host-side resolution -------------------------
+# Outside any git repo the helper stays silent (caller keeps basename(cwd)).
+assert_eq "repo_root_project on non-git path is empty" "" \
+    "$(ai_memory_repo_root_project "$TMP/nonexistent")"
+
+if command -v git >/dev/null 2>&1; then
+    REPO="$TMP/repos/acme-api"
+    mkdir -p "$REPO"
+    git init -q "$REPO"
+    git -C "$REPO" -c user.email=t@example.com -c user.name=t \
+        commit -q --allow-empty -m init
+
+    # A subdirectory of the main checkout collapses to the repo basename
+    # (not the subdir name) when the marker selects repo-root and pins no
+    # explicit project.
+    mkdir -p "$REPO/crates/cli"
+    printf 'workspace = "oss"\nproject_strategy = "repo-root"\n' >"$REPO/.ai-memory.toml"
+    QSR=$(ai_memory_marker_qs "$REPO/crates/cli")
+    assert_eq "repo-root: subdir resolves to repo basename" \
+        "&cwd=$REPO/crates/cli&workspace=oss&project=acme-api&project_strategy=repo-root" \
+        "$QSR"
+
+    # A linked worktree whose directory lives OUTSIDE the main repo tree
+    # (a common layout: tools that keep worktrees in a separate directory)
+    # has no .ai-memory.toml ancestor of its own, yet still collapses to the
+    # MAIN repo basename via the commondir pointer. The strategy comes from a
+    # marker placed above the worktrees directory.
+    WT="$TMP/worktrees/acme-api/wt-feature"
+    mkdir -p "$TMP/worktrees/acme-api"
+    printf 'workspace = "oss"\nproject_strategy = "repo-root"\n' >"$TMP/worktrees/.ai-memory.toml"
+    if git -C "$REPO" worktree add -q "$WT" >/dev/null 2>&1; then
+        QSW=$(ai_memory_marker_qs "$WT")
+        assert_eq "repo-root: out-of-tree worktree collapses to main repo" \
+            "&cwd=$WT&workspace=oss&project=acme-api&project_strategy=repo-root" \
+            "$QSW"
+    fi
+
+    # An explicit project pin always wins over repo-root resolution.
+    printf 'workspace = "oss"\nproject = "pinned"\nproject_strategy = "repo-root"\n' \
+        >"$REPO/.ai-memory.toml"
+    QSP=$(ai_memory_marker_qs "$REPO/crates/cli")
+    assert_eq "explicit project pin beats repo-root" \
+        "&cwd=$REPO/crates/cli&workspace=oss&project=pinned&project_strategy=repo-root" \
+        "$QSP"
+fi
+
 # --- url_encode -------------------------------------------------------
 assert_eq "url_encode passes safe slug"   "movvia" "$(ai_memory_url_encode "movvia")"
 assert_eq "url_encode escapes ampersand"  "a%26b"  "$(ai_memory_url_encode "a&b")"
