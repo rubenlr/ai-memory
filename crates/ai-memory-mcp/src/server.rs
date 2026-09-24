@@ -2002,7 +2002,7 @@ impl AiMemoryServer {
         let Some(embedder) = &self.embedder else {
             return None;
         };
-        match embedder.embed(query).await {
+        match embedder.embed_query(query).await {
             Ok(qv) => Some(qv),
             Err(e) => {
                 tracing::warn!(
@@ -7978,6 +7978,111 @@ mod tests {
             )
             .await;
         assert!(bad.is_err());
+    }
+
+    /// Google (and any query/document-asymmetric embedder) sends a different
+    /// task type for search queries than for indexed page bodies. The helper
+    /// that feeds hybrid `memory_query` used the generic `embed()` method,
+    /// which Google implements as `embed_document` (`RETRIEVAL_DOCUMENT`).
+    /// Indexed pages already go through `embed_document`; search text must
+    /// go through `embed_query` (`RETRIEVAL_QUERY`) or the vector stream
+    /// compares a document vector to document vectors.
+    struct QueryTaskEmbedder {
+        embed_calls: std::sync::atomic::AtomicUsize,
+        query_calls: std::sync::atomic::AtomicUsize,
+        document_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for QueryTaskEmbedder {
+        fn default() -> Self {
+            Self {
+                embed_calls: std::sync::atomic::AtomicUsize::new(0),
+                query_calls: std::sync::atomic::AtomicUsize::new(0),
+                document_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for QueryTaskEmbedder {
+        fn provider(&self) -> &'static str {
+            "google"
+        }
+
+        fn model(&self) -> &str {
+            "gemini-embedding-001"
+        }
+
+        fn dim(&self) -> u32 {
+            2
+        }
+
+        async fn embed(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            self.embed_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_document(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            self.document_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_query(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            self.query_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0, 1.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_query_embeds_search_text_as_a_query_not_a_document() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let embedder = Arc::new(QueryTaskEmbedder::default());
+        let server = server.with_embedder(embedder.clone());
+        server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: None,
+                    answer: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            embedder
+                .query_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "hybrid memory_query must embed the search text with embed_query"
+        );
+        assert_eq!(
+            embedder
+                .embed_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "embed() is the document-side method on Google; using it for search queries mixes task types"
+        );
+        assert_eq!(
+            embedder
+                .document_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "search queries must not take the indexed-document path"
+        );
     }
 
     #[tokio::test]

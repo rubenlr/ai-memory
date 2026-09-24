@@ -7,7 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `docs/jev-reranker-adapter.md` documents a stdlib-only adapter
+  (`docs/examples/jev-reranker-adapter/jev_rerank_shim.py`) that serves the
+  `AI_MEMORY_RERANKER=llm` request leg from a Jev `/v1/systemone` judge
+  endpoint while reverse-proxying consolidation/lint/bootstrap traffic to
+  the configured provider unchanged. In the contributor's own 102-query
+  golden-set benchmark the judge matched the hosted reranker's
+  hit@1/MRR/NDCG@10 (0.778/0.838/0.873 vs 0.778/0.840/0.875) at 0.205 s
+  mean latency instead of 20.2 s — in that run the hosted mean sat on the
+  server's 20 s completion timeout, which made the reranker stall every
+  query before falling back. (#873)
+
 ### Fixed
+- The Linux/macOS Docker wrapper now keeps its native host client in
+  `${XDG_DATA_HOME:-~/.local/share}/ai-memory/native-runner` instead of
+  `~/.cache/ai-memory/native-runner`. `ai-memory run` auto-wires hooks whose
+  command is that client's path (Claude Code, Codex, Kimi Code, Command Code,
+  Kiro CLI v3, Grok, Antigravity CLI), so flushing `~/.cache` left every hook of
+  those harnesses pointing at a missing binary. The wrapper also keeps the
+  release's `hooks/` bundle beside the client, so auto-wire no longer fails
+  with "could not locate hooks directory" for script-based harnesses on a host
+  where `install-hooks` never ran. (#874)
+- Fixed pre-push installation from linked worktrees and preserved the managed
+  block's position during reinstallation. Configured `core.hooksPath` overrides
+  and ambiguous markers are rejected without replacing the existing hook. The
+  block now keeps its shell options and `SSL_CERT_FILE` inside its subshell and
+  propagates a failure explicitly, so user hook commands after it keep their
+  own semantics and a failing test run still blocks the push. (#824)
+- Isolated the pre-push test process from Git's repository environment and
+  global/system configuration so fixture commands use their own repositories.
+  Existing installations need to run `scripts/install-git-hooks.sh` again. (#824)
+- `memory_query` now embeds the search text with `embed_query` rather than
+  the generic `embed()` method. Google's embedder implements `embed()` as
+  `embed_document` (`RETRIEVAL_DOCUMENT`), the same task type used when
+  indexing wiki pages, so hybrid search compared a document vector to
+  document vectors and the vector stream could not separate query from
+  passage. Indexed writes are unchanged; only the query-side helper moves
+  onto `RETRIEVAL_QUERY`. Symmetric embedders (OpenAI, Voyage, local) keep
+  the same vector they already returned from `embed()`. (#861)
+- A Windows service running as `LocalSystem` over a user-owned data
+  directory no longer breaks the wiki git history silently. libgit2's
+  dubious-ownership guard (CVE-2022-24765) fails every wiki commit with
+  `code=Owner` when the process account does not own the repository, but
+  the failure was WARN-only, so capture and search kept working while no
+  wiki checkpoint was ever committed. The startup baseline checkpoint now
+  surfaces an owner-check failure at ERROR with the remedy (run the
+  service as the owning user), and `docs/windows.md` Scenario E documents
+  running the service under a `<serviceaccount>`, corrects the claim that
+  only the data directory is account-sensitive, and notes the WinSW
+  error-1069 / stale-password gotcha for Microsoft-account / PIN / Hello
+  users. The owner check itself is deliberately left enabled. (#872)
+- A Windows folder no longer splits into two projects. The hook router
+  derived a project's *name* from the cwd after
+  `normalize_project_path_key` had ASCII-lowercased the whole
+  drive-letter/UNC path — basename included — so a session in
+  `D:\...\Default Project` was captured under `default project` while the
+  CLI (which keeps the raw basename) used `Default Project`. Because
+  `get_or_create_project` matches names case-sensitively, one folder
+  minted two projects. The router now takes the name from the raw cwd; the
+  cache key and cwd-prefix match keep the case-folded path, so #806 handoff
+  stickiness is unaffected. (#871)
 - Auto-improve review no longer stages a proposal whose LLM-produced page
   path contains a Windows-illegal character (e.g. a `:` copied from a
   conventional-commit subject). That path passed the deliberately tolerant
@@ -80,6 +140,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checksum block, which concatenates every platform's file. The zip's smoke
   test now requires LF rather than tolerating either, so the format the
   release claims is the format it ships. (#838)
+- `purge-session` now removes every page version the session owns at
+  `sessions/<id>.md` (including versions written before OKF sources existed
+  and summaries of sessions that never recorded a summary pointer), while a
+  manual page at the same path survives. (#862)
+- Shell hooks no longer pin a CPU core for minutes on a large payload. The
+  `hooks/_lib.sh` extractors for `cwd`/`workspacePaths`/`workspace_roots`,
+  the session id, and Antigravity's `invocationNum` located each key with
+  `${payload#*"key"}`, which is quadratic in the payload size under dash and
+  bash: a 200 KB Cursor `postToolUse` event spent minutes in
+  `ai_memory_extract_cwd`, and concurrent hooks stayed at 100% CPU before
+  ever reaching the POST. A shared `ai_memory_after_key` helper now finds the
+  first occurrence with one linear `awk` pass (about 50 ms at 200 KB) and
+  feeds the unchanged `sed` parsing, so the extracted values are the same as
+  before. (#870)
+- The generated TypeScript integrations (OpenCode 1 and 2, OMP, Pi,
+  OpenClaw) no longer flash a console window on Windows for every captured
+  event: their `git` lookups set `windowsHide`. The repo-root project lookup
+  behind those spawns is memoized per cwd instead of running two synchronous
+  `git` processes on every event. (#863)
 
 ## [2.4.0] - 2026-09-21
 
