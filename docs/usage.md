@@ -39,9 +39,20 @@ $ codex   # in the same directory, later
 
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
-consume that handoff automatically. No-stdout clients (Grok, Zero) should
-call `memory_handoff_list` on resume, then `memory_handoff_accept` with
-the listed `handoff_id`; listing does not claim the row.
+consume that handoff automatically. Grok shows it as `PostToolUse`
+`additionalContext` after the first tool. Until that tool runs, or if the
+session never calls one, call `memory_handoff_list` then
+`memory_handoff_accept` with the listed `handoff_id`. Zero should do that
+on resume. Listing does not claim the row.
+
+`memory_handoff_accept` says why it returned no handoff. Its `status` is
+`claimed` when the call took one, `consumed_by_hook` when the calling
+session's own SessionStart already did (the handoff is in that session's
+context), and `none_pending` when nothing is left to claim. Only a client that
+forwards its session id on MCP calls can be told `consumed_by_hook`: Claude
+Code through `install-mcp --session-aware`, or OpenCode 2. Any other client
+gets `none_pending` after the hook consumed the handoff, so its agent still
+checks its context for the delivered block first.
 
 On a server that distinguishes operators, handoffs belong to their creator by
 default: the next session for that operator sees their own plus deliberately
@@ -233,7 +244,8 @@ exists, both when both exist, or creates `CLAUDE.md` when neither exists. Use
 instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
-install under its `.grok/skills` root.
+install under its `.grok/skills` root; for Hermes Agent, `--skills-agent hermes`
+installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
 `CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
@@ -251,6 +263,7 @@ ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
+ai-memory install-skills --scope global --agent hermes
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
 ```
@@ -459,6 +472,23 @@ The session, its observations, handoffs, consolidation jobs and its
 `sessions/<id>.md` page move together; see
 [`docs/lifecycle-ops.md`](lifecycle-ops.md#move-session) for the page modes,
 guards, and what stays behind.
+
+## Repair backfilled session timestamps
+
+A `backfill` run from before it carried the transcript's own event time dates
+every imported session at import time, flattening the whole imported history
+onto one day. Re-reading the local transcripts corrects it:
+
+```bash
+ai-memory repair-backfill-timestamps --project my-app            # dry run
+ai-memory repair-backfill-timestamps --project my-app --confirm  # apply
+```
+
+It matches transcripts to sessions by id, never touches `observations` or
+pages, never assigns an end time to a still-open session, and never proposes
+a time in the future; see
+[`docs/lifecycle-ops.md`](lifecycle-ops.md#repair-backfill-timestamps) for the
+validation rules and the exact request/response shape.
 
 ## Project consolidation preferences
 

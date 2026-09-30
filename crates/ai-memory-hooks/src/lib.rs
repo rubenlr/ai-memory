@@ -21,13 +21,19 @@
 //! This crate does not read process environment directly; server configuration
 //! is resolved once by `ai-memory-cli` and threaded in as typed state.
 
+pub mod antigravity;
 mod assistant_capture;
 pub mod capture_policy;
+mod grants;
 pub mod log;
 pub mod payload;
 pub mod router;
 pub mod synth;
 pub mod workstream;
+
+pub use antigravity::{
+    MAX_ANTIGRAVITY_OUTPUT_BYTES, enrich_antigravity_step_output, is_output_eligible,
+};
 
 // Re-export the sanitizer types from core so callers that grew up
 // pointing at this crate's `sanitize` module keep working.

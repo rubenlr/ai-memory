@@ -243,6 +243,13 @@ extension seam, not a runtime plugin system: external processors must use
 the existing HTTP/MCP APIs and cannot bypass the sanitizer, hook
 backpressure, or single-writer SQLite actor.
 
+An external lifecycle producer can set `AI_MEMORY_CAPTURE_OWNER` on the harness
+process to suppress its installed native capture while retaining supported
+handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
+for provenance and stable, namespaced `ingest_key` values for retries. See the
+[external capture contract](external-lifecycle.md) for batching, identity and
+the limits of this cooperative process-scoped mode.
+
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 16 KiB; notification and tool excerpts are capped at 2 KB. Native
@@ -298,7 +305,7 @@ prunable rather than only after it ages in place.
 
 | Table | What |
 |---|---|
-| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
+| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` — `docs/users.md#per-project-access`. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
@@ -449,7 +456,7 @@ invariants below.
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) scales the digest's max-token budget off its base (16 000; same 1x/1.5x/2x/3x/4x mapping as `memory_query`); inert on the no-provider briefing-only path, and `minimal` is byte-identical. |
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. Returns `handoff` plus `status`: `claimed` (this call won it), `consumed_by_hook` (the calling session's own SessionStart claimed it, so it is already in context; needs the session id the hook claimed under, i.e. a session-aware client), or `none_pending`. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
 | `memory_message_send` | destructive | Send a directed cross-project message into another project's inbox (V64). Requires `to_workspace` + `to_project`; the recipient must already exist (fail-closed, never created). Body is secret-scrubbed and size-capped. The one tool that crosses project isolation on purpose. |
 | `memory_message_list` | read-only | List pending mail for this project — `box="inbox"` (poppable, default) or `box="outbox"` (cancellable). Bodies are untrusted cross-project input. |
@@ -468,7 +475,7 @@ long-lived entry appearing there is that policy working rather than a fault.
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
-| `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the 0.4–0.75 cosine-similarity band ("same topic, not a near-duplicate" — ≥0.75 is A3 dedup, <0.4 unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. |
+| `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate" — at/above the max is A3 dedup, below the min unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. On a single-language or single-domain store, background similarity between unrelated pages already sits well above the default floor, so the band measures domain proximity more than conflict and produces noisy findings — raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) for such a store. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
@@ -552,16 +559,34 @@ embed                generate-auth-token  setup-agent
 bootstrap            install-instructions install-skills
 reorg                purge-project        rename-project
 move-project         move-session         uninstall
-auth                 user                 completions
-handoffs             purge-session        compact
-api-key              export-okf           message
-doctor               backfill
+upgrade              auth                 user
+completions          handoffs             purge-session
+compact              api-key              export-okf
+message              doctor               backfill
+project              reclaim-ledger-versions               repair-backfill-timestamps
+server
 ```
 
 Run `ai-memory --help` for the full tree.
 
 `auto-improve-report` is read-only by default; `--stage` creates one pending
 telemetry report page for audit/approval without staging learning-memory edits.
+
+`reclaim-ledger-versions` drops the superseded versions of the raw hook event
+ledger that the pre-2.1.1 indexer left behind (#660). It is a dry run unless
+`--confirm` is passed. A path is only a candidate when its *content* opens
+with a hook log entry — the same
+`ai_memory_core::log_ledger::body_opens_with_log_ledger` gate the indexer
+(#660), the OKF conformance migration (#669) and the bundle export (#748) use
+— so a real page named `log-2026-09.md` keeps its whole version chain. Only
+`is_latest=0 AND superseded_at IS NULL` rows are eligible, so rows a decay
+tombstone owns stay with `forget-sweep`. Derived FTS/entity/vector/link rows
+go with the page through the existing `ON DELETE CASCADE`s, and the FTS delete
+trigger is stood down for the bulk delete (its DDL is read back from
+`sqlite_master` and re-executed) so the cleanup does not re-tokenize tens of
+gigabytes of ledger body row by row; `pages_fts` is then rebuilt wholesale.
+`--compact` additionally `VACUUM`s to return the bytes, at the cost `compact`
+documents.
 
 ## Cross-cutting invariants
 
@@ -629,10 +654,20 @@ tcp_keepalive_secs = 60            # idle time before TCP keepalive probes an ac
                                    # (laptop sleep, VPN flap) that would otherwise leak fds
                                    # until EMFILE (#792). 0 disables keepalive. Env:
                                    # AI_MEMORY_TCP_KEEPALIVE_SECS
+contradiction_band_min = 0.4       # `memory_lint`'s A5 zero-LLM contradiction band
+contradiction_band_max = 0.75      # (lower/upper cosine-similarity edge). The band is a
+                                   # fixed absolute cosine value, but a single-language or
+                                   # single-domain store's background similarity sits well
+                                   # above the general-purpose default, so the default band
+                                   # ends up measuring domain proximity rather than conflict
+                                   # and produces noisy findings — raise `contradiction_band_min`
+                                   # for such a store. Must satisfy 0.0 <= min < max <= 1.0.
+                                   # Env: AI_MEMORY_CONTRADICTION_BAND_MIN /
+                                   # AI_MEMORY_CONTRADICTION_BAND_MAX
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
-# AI_MEMORY_RUN_AUTOWIRE).
+# AI_MEMORY_RUN_AUTOWIRE / AI_MEMORY_CLAUDE_TRUE_YOLO).
 capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
                                    # client's sanitized assistant-final-message marker
                                    # on Stop (#196). Client half is baked separately by
@@ -644,7 +679,35 @@ backfill_on_start = true           # on first SessionStart in a brand-new (empty
                                    # backfill` runs it by hand.
 run_autowire = true                # `ai-memory run <harness>` auto-installs that harness's
                                    # hooks + MCP on first launch if missing (idempotent,
-                                   # one-time per harness+version). Also `--no-autowire`.
+                                   # one-time per harness+version+install location).
+                                   # Also `--no-autowire`.
+claude_true_yolo = false           # opt-in: on a Claude `ai-memory run --yolo`, also
+                                   # silence the residual `--dangerously-skip-permissions`
+                                   # prompts (rm timeout/confirmation, PowerShell rm deny)
+                                   # and force `bypassPermissions` via `--settings`.
+                                   # Claude-only, no-op for every other harness. Also
+                                   # `--true-yolo`. See
+                                   # docs/design-yolo-safety-ai-jail.md.
+release_base_url = ""              # override the GitHub releases base URL that `ai-memory
+                                   # upgrade` checks and downloads from (#801). Empty =
+                                   # https://github.com/akitaonrails/ai-memory/releases.
+                                   # For hermetic tests / mirrors, not day-to-day installs.
+                                   # Env: AI_MEMORY_RELEASE_BASE_URL.
+
+[maintenance]                      # scheduled server jobs (run outside hook latency)
+enabled = true                     # master switch for the scheduled jobs below
+forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists
+                                   # across restarts; overdue work starts after a bounded delay
+lint_interval_secs = 86400         # rule-based wiki lint; 0 disables (same persistence)
+embedding_backfill_interval_secs = 0  # embedding backfill; 0 = off (may call a paid provider)
+reconcile_tombstones_deleted_pages = false
+                                   # opt-in (#929/#964): the 30s reconcile pass soft-tombstones
+                                   # (is_latest=0 + superseded_at — never a filesystem write) an
+                                   # OKF-imported content page whose file has been missing on
+                                   # two consecutive passes, behind a circuit breaker and with
+                                   # session pages excluded. OFF = byte-identical to pre-2.5
+                                   # behavior (deletions still need `ai-memory delete-page`).
+                                   # Docs: docs/okf.md, docs/install.md.
 
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)
@@ -688,9 +751,17 @@ per_user = false                  # shared + own slots in agent context
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000
+                                   # a flat chars-per-token heuristic, so it
+                                   # UNDER-budgets denser corpora: pt-BR prose
+                                   # and source code tokenize at fewer chars per
+                                   # token than English and can overshoot the
+                                   # provider's real limit by ~40% — lower this
+                                   # (or input_token_safety_margin) for such a corpus
 max_output_tokens = 32000          # provider generation limit; min 1000
                                    # their sum must fit the model context window;
                                    # leave headroom for tokenizer variance
+input_token_safety_margin = 0.8    # scales the char budget, (0.0, 1.0]; the
+                                   # 0.8 default buys pt-BR/code headroom
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review
@@ -700,6 +771,7 @@ min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
 max_patchable_pages = 8
+patchable_page_prefixes = ["_rules/", "procedures/"]
 max_patchable_body_chars = 8000
 max_edits_per_proposal = 5
 max_edit_content_chars = 4000
@@ -748,6 +820,60 @@ belief_authority_weight = 0.0     # fold read-time belief-strength confidence (P
                                   # no belief query runs. confidence/evidence_count are still
                                   # exposed in explain regardless (inert). DEFAULT OFF,
                                   # R2-gated: do not default on without a positive R2 delta.
+
+[search.fts]                      # FTS5 query-preparation tuning (contrast with [retrieval]:
+                                  # this is not a ranking signal). Omit the whole section for
+                                  # byte-identical behaviour on every existing install.
+# stopwords = []                  # words dropped from a bare natural-language FTS query
+                                  # before the OR-join. Three states:
+                                  #   - key absent (the default): the built-in English list
+                                  #     (a/an/and/the/…, ~60 entries) — unchanged behaviour.
+                                  #   - stopwords = []: disables the filter entirely, English
+                                  #     included.
+                                  #   - a non-empty list: REPLACES the default outright with
+                                  #     exactly those words (does not extend the English list).
+                                  # Entries are folded to lowercase with Unicode case folding
+                                  # (not ASCII-only — a sentence-initial "É" or all-caps "NÃO"
+                                  # still matches a lowercase entry), and a query token is
+                                  # compared the same way, but diacritics are never stripped:
+                                  # "e" and "é" stay distinct. What matters here is how a query
+                                  # is actually TYPED, not how wiki content is spelled — content
+                                  # matches through the FTS index's own diacritic-folding
+                                  # tokenizer regardless, but this filter only ever sees the
+                                  # literal characters someone typed. So a list for an accented
+                                  # language should include every spelling a user or agent might
+                                  # type, e.g. Portuguese BOTH "e" and "é", BOTH "nao" and "não".
+                                  # The filter also matches whitespace-split raw tokens before
+                                  # any punctuation handling, so an entry never matches a token
+                                  # with attached punctuation ("de," / "que?") — the same
+                                  # limitation English stopwords have always had. Explicit FTS5
+                                  # syntax (quoted phrases, OR/AND/NOT/NEAR, parens) always
+                                  # bypasses this filter, exactly as it does with the built-in
+                                  # list; a bare query made ONLY of configured stopwords keeps
+                                  # them all rather than returning nothing. At most 2000 entries
+                                  # of at most 64 characters each, no internal whitespace
+                                  # (entries are matched against single whitespace-split
+                                  # tokens); anything past that fails startup.
+                                  #
+                                  # Env override: AI_MEMORY_SEARCH_FTS_STOPWORDS as a
+                                  # comma-separated string — the same convention
+                                  # allowed_hosts/cors_allow_origins/auth.trusted_proxy_cidrs
+                                  # use for a Vec<String> — but read once as data in
+                                  # Config::load rather than through the usual `__`-split env
+                                  # layer, because a present-but-blank env var must mean
+                                  # "unset" (leave config.toml's value alone), never an
+                                  # accidental "disable filtering"; the automatic layer merges
+                                  # raw values before any such distinction could be made.
+                                  #
+                                  # Non-English example — a Portuguese-majority wiki, so its
+                                  # own function words (not English's) get filtered, spelling
+                                  # out both accented and unaccented forms someone might type:
+                                  # stopwords = [
+                                  #   "a", "o", "as", "os", "de", "da", "do", "das", "dos",
+                                  #   "em", "um", "uma", "uns", "umas", "com", "para", "por",
+                                  #   "que", "se", "no", "na", "nos", "nas", "e", "ou",
+                                  #   "nao", "não", "voce", "você",
+                                  # ]
 
 [dream]                           # B2/B3/B4 opt-in LLM "dream" pass. OFF by default,
                                   # R2-gated before it may default on. Never deletes a source.
@@ -888,6 +1014,12 @@ AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
 AI_MEMORY_EMBEDDING_BASE_URL   optional override; required for openai-compat
 AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI, Copilot), 1024 (Voyage), 768 (Google);
                                required explicitly for openai-compat
+AI_MEMORY_EMBEDDING_QUERY_PREFIX     optional; prepended to query text before
+                                     embedding (openai / openai-compat only)
+AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX  optional; prepended to document text
+                                     before embedding (openai / openai-compat
+                                     only); e.g. "query: " / "passage: " for
+                                     Nemotron-3-Embed / base E5
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
                                optional bearer auth for openai-compat
@@ -936,7 +1068,9 @@ embeddings spec, and is not covered by a live test against Copilot here.
   keeping deletes and semantic rewrites review-gated.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web` — project list, page
-  tree, page view, search). It stays read-only by design: the wiki is a
+  tree, page view, search, and the root-only `/web/pending` triage page,
+  whose approve and reject buttons post to the existing
+  `/admin/pending-writes/*` routes). It stays read-only by design: the wiki is a
   machine-authored record, and a browser edit surface would break the
   invariant the whole store rests on (#482). Better *reading* — richer
   navigation, diff/history views, graph exploration — is open. See

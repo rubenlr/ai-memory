@@ -1143,13 +1143,14 @@ pub(crate) fn search_events(
     workstream_id: WorkstreamId,
     query: &str,
     limit: usize,
+    stopwords: &crate::fts_query::FtsStopwords,
 ) -> StoreResult<Vec<WorkstreamEvent>> {
     let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
     let free_text = query
         .replace("title:", "")
         .replace("body:", "")
         .replace("content:", "");
-    let fts_query = crate::prepare_fts5_query(&free_text);
+    let fts_query = crate::prepare_fts5_query(&free_text, stopwords);
     let sql = if fts_query.is_empty() {
         "SELECT sequence, event_id, agent_kind, native_session_id, kind, role, content, occurred_at \
          FROM workstream_events WHERE workstream_id = ?1 ORDER BY sequence DESC LIMIT ?2"

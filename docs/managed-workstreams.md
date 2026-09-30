@@ -13,7 +13,11 @@ harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
 not already wired, so capture and recall work without a separate `install-hooks`
 / `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
 nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
-one-time per harness + binary version, preserves unrelated user config, runs
+one-time per harness, binary version and install location (a second config home,
+such as another `CLAUDE_CONFIG_DIR`, gets its own first launch; `ai-memory
+uninstall` of hooks or MCP clears that record, so the next launch wires again),
+preserves
+unrelated user config, runs
 before the harness starts so it picks up the fresh hooks, and is best-effort —
 if an install fails it warns and still launches. Harnesses without installer
 support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
@@ -84,7 +88,7 @@ file, and the current checkout remain authoritative.
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh]
+              [--yolo] [--fresh] [--env KEY=VALUE]... [--env-file PATH]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -348,6 +352,13 @@ resume, continue, session, or fork selector.
 5. Imports use deterministic event ids, incremental source cursors, immutable
    sanitized JSONL segments, and bounded batches. A retry cannot duplicate
    history. The native process's exit code is preserved.
+6. Command Code, Kiro CLI and Antigravity CLI have no native session-end hook,
+   so for them the run then finalizes the session itself (again after a
+   resume), as `ai-memory finalize-session --reopen` would: summary, handoff
+   and opt-in SessionEnd consolidation. It does this only for a session named
+   on the command line, chosen before the spawn, or linked during the run,
+   never for one it had to look for. If finalizing fails, it prints the exact
+   `finalize-session` command to run instead.
 
 The next harness receives a bounded recent delta because no agent context window
 can safely absorb an unbounded transcript. The complete visible ledger remains
@@ -372,14 +383,22 @@ is labelled completed evidence and must never be replayed as a pending call.
 | OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only |
 | OpenCode 2 beta | native default creation | `--session <id>` | same `opencode.db` as v1 (the beta channel keeps v1's filename; the beta adds `session_v2`/`session_message` tables beside v1's); launched via the `opencode2` binary |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
-| Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
+| Crush | native default creation | `--session <id>` | `<data dir>/crush.db` opened read-only: `options.data_directory` from Crush's JSON configs, else the closest `.crush` up to the git worktree root, else `<cwd>/.crush` |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
 | Command Code | native default creation | `--session <uuid>` | `~/.commandcode/projects/*/<uuid>.jsonl` |
 | Kiro CLI v2 | native default creation | `--resume-id <uuid>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
-| OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
+| OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`, or the XDG session directory described below |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
+
+OMP's agent directory is `~/.omp/agent` for the default profile and
+`~/.omp/profiles/<name>/agent` for a named profile. `PI_CONFIG_DIR` changes the
+`.omp` root relative to the user's home. The default profile can also use
+`PI_CODING_AGENT_DIR`. On Linux and macOS, sessions move to
+`$XDG_DATA_HOME/omp/sessions`, or `$XDG_DATA_HOME/omp/profiles/<name>/sessions`
+for a named profile, when that OMP directory exists and the agent directory
+has not been relocated.
 
 Command Code v3 transcripts are self-describing and append-only. The adapter
 requires the UUID filename, header id, and canonical header `cwd` to agree
@@ -398,20 +417,61 @@ An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
+
+Crush has no hooks to link its session: a fresh Crush launch claims the one top-level session
+created while it ran (its title and sub-agent sessions do not count), and
+imports nothing, with a warning, when another launch on the same store created
+one too; resume that session with `--session <id>` to link it. `--continue`
+claims the one session it touched on the same terms. When the data directory
+lies outside the project, as a global `data_directory` does, other projects'
+sessions share it and Crush records no directory per session, so a run claims
+only a session that edited a file in this project (its sub-agents' edits
+count), and only when it is the one; otherwise it imports nothing, with the
+same warning. The store's real location decides, so a `.crush` symlinked to a
+shared directory is shared. Another project's session that edited a file here
+still counts as this project's.
 Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
-through unchanged and used as the read-only import root. Native store
+through unchanged and used as the read-only import root. Without `--data-dir`,
+ai-memory finds Crush's data directory as Crush does, except that it does not
+run a `crushrc` to read one set only there; pass `--data-dir` in that case. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
-`KIRO_HOME`, and `GROK_HOME`.
-Export these in the environment `ai-memory run` itself sees — not only inside a
-harness wrapper script. `ai-memory run` resolves the native session directory
-(and installs hooks) from its own environment; if the harness writes its
-transcript under a custom `CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see,
-the two disagree and the native transcript import fails. When you use per-account
+`KIRO_HOME`, and `GROK_HOME`, plus OMP's `PI_CONFIG_DIR`.
+OMP profile selection follows a leading `--profile`, then `OMP_PROFILE`, then
+`PI_PROFILE`. A named profile ignores `PI_CODING_AGENT_DIR`. A `--profile`
+later in the command line is left to OMP; use `OMP_PROFILE` or
+`--env OMP_PROFILE=<name>` so ai-memory can resolve the same profile.
+
+Blank directory overrides (empty or whitespace-only values) count as unset.
+Session import, hooks and MCP use their fallback paths, and `ai-memory run`
+removes those values from the child environment. Profile variables follow a
+different rule: an empty `OMP_PROFILE` selects the default profile and still
+takes precedence over `PI_PROFILE`.
+Export these in the environment `ai-memory run` itself sees, or pass them with
+`--env` (below), not only inside a harness wrapper script. `ai-memory run`
+resolves the native session directory, and auto-wires hooks and MCP, from that
+environment; if the harness writes its transcript under a custom
+`CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see, the two disagree and the
+native transcript import fails. When you use per-account
 config directories, set the variable before invoking `ai-memory run` (or in the
 same wrapper that also runs it), so hook installation and native-session
 resolution agree.
+
+A repeatable `ai-memory run --env KEY=VALUE <harness>` (and `--env-file
+<path>`, one `KEY=VALUE` per line, blank lines and `#` comments skipped) is
+the first-class alternative to the `env KEY=VAL harness` wrapper-alias
+pattern above: it is a wrapper-owned flag, so it must precede the harness
+name, and the resolved environment reaches the spawned harness process,
+`ai-memory run`'s own native-session resolution, *and* first-launch auto-wire.
+Hooks, MCP and transcript import then follow the same config home, which is the
+`CLAUDE_CONFIG_DIR`-agreement requirement described above, without exporting the
+variable into the invoking shell first. A later `--env` overrides a same-key
+`--env-file` entry; neither expands nor interprets the value, so let the shell
+expand `$HOME` on the command line and write absolute paths in an
+`--env-file`. Manual `install-hooks` / `install-mcp` do not take `--env`; they
+read their own environment.
+
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
@@ -507,7 +567,8 @@ transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
 checks the configured v3 root first and that default root as a compatibility
 fallback. If a linked session exists only in the fallback, ai-memory removes
 `KIRO_HOME` for that one resume so Kiro can find the session; Kiro consequently
-uses its default-home v3 settings/hooks for that process. Fresh launches and
+uses its default-home v3 settings/hooks for that process, and first-launch
+auto-wire wires that default home rather than `KIRO_HOME`. Fresh launches and
 versions that store the session below the configured root keep `KIRO_HOME`
 unchanged. Every candidate still needs exact id, schema, and checkout metadata.
 The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
@@ -556,9 +617,17 @@ Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
 auto-detection set; name it explicitly.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
-its one-time context from the server, copies the existing global Crush JSON into
-a private temporary directory, appends an ephemeral context path, and points the
-child at that directory with `CRUSH_GLOBAL_CONFIG`. Delivery is acknowledged
+its one-time context from the server, copies the global Crush JSON the launch
+would read (`$CRUSH_GLOBAL_CONFIG/crush.json`, else
+`$XDG_CONFIG_HOME/crush/crush.json`, else `~/.config/crush/crush.json`, with
+`--env` entries first and a blank value counting as unset) into a private
+temporary directory, appends an ephemeral context path, and points the child at
+that directory with `CRUSH_GLOBAL_CONFIG`. When that JSON lists no
+`global_context_paths`, the launcher first adds the `CRUSH.md` and `AGENTS.md`
+Crush would have loaded by default, so the packet does not replace them. A
+global `crushrc` next to that JSON is carried over by a generated `crushrc` in
+the temporary directory that sources it from its own directory, where Crush
+runs it. Delivery is acknowledged
 only after the child starts, so a spawn failure cannot lose the packet. The
 original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.

@@ -184,6 +184,12 @@ pub struct Wiki {
     /// write after the scope's first — the store query and the two manifest
     /// reads happen once per scope per process, never per page.
     manifested_scopes: Arc<Mutex<HashSet<(WorkspaceId, ProjectId)>>>,
+    /// `[maintenance] reconcile_tombstones_deleted_pages` (#929), read once by
+    /// `Config::load` and threaded here via [`Wiki::with_reconcile_tombstones_deleted_pages`].
+    /// OFF by default: with this `false`, the watcher's reconcile pass never
+    /// tombstones a page whose file vanished — deletions still require
+    /// `ai-memory delete-page`, unchanged from before this feature existed.
+    reconcile_tombstones_deleted_pages: bool,
 }
 
 /// Key uniquely identifying a page for per-path write serialization.
@@ -211,6 +217,7 @@ impl Wiki {
             mutation_lock: Arc::new(RwLock::new(())),
             page_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             manifested_scopes: Arc::new(Mutex::new(HashSet::new())),
+            reconcile_tombstones_deleted_pages: false,
         })
     }
 
@@ -243,6 +250,24 @@ impl Wiki {
     pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
         self.store_reader = Some(reader);
         self
+    }
+
+    /// Opt into the watcher reconcile pass's tombstone-on-missing-file safety
+    /// net (`[maintenance] reconcile_tombstones_deleted_pages`, #929). `false`
+    /// (the default from [`Wiki::new`]) leaves reconcile's behavior exactly
+    /// as it was before this feature: deletions require `ai-memory
+    /// delete-page`.
+    #[must_use]
+    pub fn with_reconcile_tombstones_deleted_pages(mut self, enabled: bool) -> Self {
+        self.reconcile_tombstones_deleted_pages = enabled;
+        self
+    }
+
+    /// Whether the watcher's reconcile pass may tombstone a page whose file
+    /// disappeared. See [`Wiki::with_reconcile_tombstones_deleted_pages`].
+    #[must_use]
+    pub(crate) fn reconcile_tombstones_deleted_pages(&self) -> bool {
+        self.reconcile_tombstones_deleted_pages
     }
 
     /// Replace the default built-in-only sanitizer with one carrying
@@ -910,6 +935,108 @@ impl Wiki {
         .await
     }
 
+    /// `(PageId, PagePath)` of every `is_latest = 1` page in a scope, for the
+    /// watcher's reconcile-delete safety net (#929) to snapshot before it
+    /// walks the wiki tree.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// store error.
+    pub(crate) async fn latest_page_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<Vec<(PageId, PagePath)>> {
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("reconcile-delete candidate snapshot requires a store reader")
+        })?;
+        reader
+            .latest_page_ids(workspace_id, project_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Tombstone the expected latest page after the watcher's reconcile pass
+    /// found its file missing on two consecutive passes (opt-in, #929;
+    /// `[maintenance] reconcile_tombstones_deleted_pages`).
+    ///
+    /// Deliberately does NOT go through [`Wiki::remove_page_locked`]: unlike
+    /// `evict_page_if_latest` (decay) or `delete_page_if_latest` (explicit
+    /// delete), this is a background safety net reacting to a file that is
+    /// already gone, not a user-initiated action, so it never runs the
+    /// BLOCKING admission gate (`AdmissionChain::notify`/`authorize`) —
+    /// nothing gets to refuse it — and it never touches the filesystem —
+    /// there is nothing on disk to quarantine or remove. It DOES
+    /// fire-and-forget the chain's non-blocking observer/mirror webhooks on
+    /// success (#929 review, S6), same as `remove_page_locked`'s post-write
+    /// `dispatch_async`, so a mirror learns about the tombstone instead of
+    /// silently diverging from the source of truth.
+    ///
+    /// Re-checks both the store's latest-id and the file's actual absence
+    /// while holding the exclusive mutation guard, immediately before
+    /// writing — the final gate design item #6 calls for, closing the window
+    /// between the reconcile pass's second "missing" observation and this
+    /// call (e.g. a concurrent `write_page` recreating the path).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem or store error.
+    pub(crate) async fn tombstone_missing_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        expected_latest_id: PageId,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self
+            .store_reader
+            .as_ref()
+            .ok_or_else(|| ai_memory_wiki_error("reconcile tombstone requires a store reader"))?;
+        let current = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        if current != Some(expected_latest_id) {
+            return Ok(false);
+        }
+        let abs = self.abs_path(workspace_id, project_id, path);
+        if abs.try_exists()? {
+            // The file came back (e.g. a slow atomic-save pattern beyond the
+            // two-pass window, or a deliberate rewrite mid-check). Leave the
+            // page alone; the next reconcile tick reindexes it normally.
+            return Ok(false);
+        }
+        let tombstoned = self
+            .writer
+            .soft_delete_for_reconcile_if_latest(
+                workspace_id,
+                project_id,
+                path.clone(),
+                expected_latest_id,
+            )
+            .await?;
+        if tombstoned && let Some(chain) = &self.admission_chain {
+            // Non-blocking observers/mirrors only (#929 review, S6) — never
+            // the blocking `notify`/`authorize` gate: this is a background
+            // safety net, not a user-initiated delete, so nothing gets to
+            // refuse it. But a mirror that never hears about the tombstone
+            // silently diverges from the source of truth, which is a real
+            // correctness issue too; fire-and-forget informs it the same way
+            // `remove_page_locked` does for `evict_page_if_latest` and
+            // `delete_page_if_latest`, just skipping their blocking half.
+            let mut ctx = AdmissionContext {
+                op: AdmissionOp::Delete,
+                ..Default::default()
+            };
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", &ctx);
+        }
+        Ok(tombstoned)
+    }
+
     async fn remove_page_locked(
         &self,
         workspace_id: WorkspaceId,
@@ -1310,9 +1437,21 @@ impl Wiki {
         compaction: ai_memory_store::Compaction,
     ) -> WikiResult<PurgeSessionOutcome> {
         let _guard = self.mutation_lock.write().await;
+        // Always `Commit`: a caller that only wants a preview (the HTTP
+        // handler's `dry_run` branch) goes straight through
+        // `WriterHandle::purge_session` instead, bypassing this wrapper
+        // entirely, so the file-removal loop below never runs over paths
+        // that a preview only *predicts* would be removed.
         let summary = self
             .writer
-            .purge_session(workspace_id, project_id, session_id, author_id, compaction)
+            .purge_session(
+                workspace_id,
+                project_id,
+                session_id,
+                author_id,
+                compaction,
+                ai_memory_store::PurgeMode::Commit,
+            )
             .await?;
         let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
         let mut files_failed = Vec::new();
@@ -2380,7 +2519,11 @@ impl Wiki {
                         page_id,
                         bytes,
                         embedder.provider().to_string(),
-                        embedder.model().to_string(),
+                        // Not `.model()`: a configured document prefix must land
+                        // under a distinct stored identity so a prefix change is
+                        // never silently mixed with vectors embedded under a
+                        // different (or no) prefix. See `Embedder::model_identity`.
+                        embedder.model_identity(),
                         embedder.dim(),
                     )
                     .await?;
@@ -2414,7 +2557,8 @@ impl Wiki {
                             page_id,
                             vector_bytes: f32_vec_to_bytes(&vec),
                             provider: embedder.provider().to_string(),
-                            model: embedder.model().to_string(),
+                            // See the body-embedding write above.
+                            model: embedder.model_identity(),
                             dim: embedder.dim(),
                         }])
                         .await?;
@@ -4232,7 +4376,7 @@ mod tests {
         // FTS5 finds it via the store reader.
         let hits = store
             .reader
-            .search_pages("karpathy".into(), 5)
+            .search_pages("karpathy".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -4341,6 +4485,360 @@ mod tests {
                 .unwrap(),
             Some(page_id),
         );
+    }
+
+    // --- #929: reconcile-delete tombstone op (`tombstone_missing_page_if_latest`) ---
+
+    #[tokio::test]
+    async fn reconcile_tombstone_refuses_a_stale_latest_id() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/stale-reconcile.md").unwrap();
+        let stale = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "old candidate",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let current = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "new current body",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        std::fs::remove_file(wiki.abs_path(ws, proj, &path)).unwrap();
+
+        assert!(
+            !wiki
+                .tombstone_missing_page_if_latest(ws, proj, &path, stale)
+                .await
+                .unwrap(),
+            "a stale expected id must leave the current version untouched"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(current),
+        );
+    }
+
+    /// Design item #6: the final recheck, immediately before acting, must
+    /// refuse when the file has actually come back — even though the caller
+    /// (the watcher's reconcile pass) only calls this after two consecutive
+    /// "missing" observations, a page can still be recreated in the narrow
+    /// window between the second observation and this call.
+    #[tokio::test]
+    async fn reconcile_tombstone_refuses_when_the_file_still_exists() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/present-reconcile.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "still here",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            !wiki
+                .tombstone_missing_page_if_latest(ws, proj, &path, page_id)
+                .await
+                .unwrap(),
+            "the file exists on disk; the final recheck must refuse to tombstone it"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(page_id),
+        );
+        assert!(wiki.abs_path(ws, proj, &path).exists());
+    }
+
+    /// The tombstone op is a background safety net reacting to a file that is
+    /// already gone, not a user-initiated delete: it must never run the
+    /// BLOCKING admission gate, which could refuse it. A webhook configured
+    /// to reject every `Delete` event proves this by NOT blocking the
+    /// tombstone — if `tombstone_missing_page_if_latest` went through the
+    /// same path as `evict_page_if_latest`/`delete_page_if_latest`, this
+    /// webhook would turn the call into an error
+    /// (`rejecting_delete_admission_leaves_decay_candidate_live` shows
+    /// exactly that for the decay path). It DOES still fire-and-forget any
+    /// non-blocking observer/mirror webhook on success — see
+    /// `reconcile_tombstone_dispatches_non_blocking_observer_webhook` below
+    /// (#929 review, S6).
+    #[tokio::test]
+    async fn reconcile_tombstone_does_not_dispatch_admission_webhook() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/reject",
+            post(|| async { (StatusCode::FORBIDDEN, "must never be called") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/webhook-reconcile.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "vanishing",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        std::fs::remove_file(wiki.abs_path(ws, proj, &path)).unwrap();
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "reconcile-guard".into(),
+                url: format!("http://{addr}/reject"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::Delete],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+
+        assert!(
+            wiki.tombstone_missing_page_if_latest(ws, proj, &path, page_id)
+                .await
+                .unwrap(),
+            "no admission dispatch means the rejecting webhook is never consulted"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+            "the page is no longer latest",
+        );
+    }
+
+    /// S6 (#929 review): the tombstone op skips the BLOCKING admission gate
+    /// (proven above), but a mirror that never hears about the tombstone at
+    /// all would silently diverge from the source of truth — a real
+    /// correctness issue on its own. A non-blocking observer webhook must
+    /// still be fired, fire-and-forget, on a successful tombstone.
+    #[tokio::test]
+    async fn reconcile_tombstone_dispatches_non_blocking_observer_webhook() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        let observed = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/observe",
+                post(|State(flag): State<Arc<AtomicBool>>| async move {
+                    flag.store(true, Ordering::SeqCst);
+                    StatusCode::OK
+                }),
+            )
+            .with_state(observed.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/mirror-reconcile.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "vanishing",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        std::fs::remove_file(wiki.abs_path(ws, proj, &path)).unwrap();
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "mirror-observer".into(),
+                url: format!("http://{addr}/observe"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Ignore,
+                events: vec![AdmissionOp::Delete],
+                blocking: false,
+            }])
+            .unwrap(),
+        );
+
+        assert!(
+            wiki.tombstone_missing_page_if_latest(ws, proj, &path, page_id)
+                .await
+                .unwrap()
+        );
+
+        // `dispatch_async` fires the request off the caller's path; give it a
+        // bounded window to land instead of asserting immediately.
+        let mut delivered = false;
+        for _ in 0..50 {
+            if observed.load(Ordering::SeqCst) {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            delivered,
+            "the non-blocking observer webhook must be notified of the tombstone"
+        );
+    }
+
+    /// The op never touches the filesystem (design item #7: there is nothing
+    /// to touch — the file is already gone). Proven by the project
+    /// directory's file listing being byte-for-byte identical before and
+    /// after the call: no quarantine artifact, no recreated file, nothing.
+    #[tokio::test]
+    async fn reconcile_tombstone_never_touches_the_filesystem() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/vanishing-fs.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "gone soon",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let proj_dir = wiki.project_root(ws, proj);
+        std::fs::remove_file(wiki.abs_path(ws, proj, &path)).unwrap();
+
+        let listing_before = list_dir_recursive(&proj_dir);
+        assert!(
+            wiki.tombstone_missing_page_if_latest(ws, proj, &path, page_id)
+                .await
+                .unwrap()
+        );
+        let listing_after = list_dir_recursive(&proj_dir);
+        assert_eq!(
+            listing_before, listing_after,
+            "the tombstone op must not create, remove, or rename any file"
+        );
+    }
+
+    /// `restore-page`/wiki history depend on this: a reconcile tombstone is
+    /// `is_latest = 0` + `superseded_at`, mirroring decay eviction exactly —
+    /// and is picked up by the SAME aged-tombstone sweep decay eviction uses
+    /// (`hard_delete_after_days`, tier/pin-agnostic), not exempted from it.
+    /// Proven by fetching the row back through the same query that sweep
+    /// uses ([`ai_memory_store::ReaderPool::decay_tombstones_before`]): if
+    /// the row were gone, or if only `is_latest` had flipped without
+    /// `superseded_at`, it would not show up there. What actually protects a
+    /// reconcile tombstone from that sweep permanently destroying a
+    /// self-healed false positive is `upsert_page_in_tx`'s resurrection path
+    /// (`ops.rs`): if the file comes back, the new version re-links onto
+    /// this chain and clears `superseded_at`, which is covered separately by
+    /// `reconcile_tombstone_resurrects_instead_of_orphaning_on_recreate`.
+    #[tokio::test]
+    async fn reconcile_tombstone_is_a_soft_delete_visible_to_normal_retention() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/tombstone-shape.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "about to vanish",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        std::fs::remove_file(wiki.abs_path(ws, proj, &path)).unwrap();
+
+        assert!(
+            wiki.tombstone_missing_page_if_latest(ws, proj, &path, page_id)
+                .await
+                .unwrap()
+        );
+
+        // is_latest = 0: no longer the scope's current version.
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+        // superseded_at set (not just is_latest): the row surfaces through the
+        // exact query the decay retention sweep uses to find eligible aged
+        // tombstones — proving it is a real tombstone, not merely hidden, and
+        // that hard cleanup is left to that same normal retention path.
+        let far_future = jiff::Timestamp::now().as_microsecond() + 365 * 24 * 3_600 * 1_000_000;
+        let tombstones = store
+            .reader
+            .decay_tombstones_before(ws, proj, far_future)
+            .await
+            .unwrap();
+        assert!(
+            tombstones.iter().any(|t| t.id == page_id && t.path == path),
+            "the reconcile tombstone must be indistinguishable from a decay tombstone to the \
+             retention sweep: {tombstones:?}",
+        );
+    }
+
+    fn list_dir_recursive(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.push(
+                        path.strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
     }
 
     #[tokio::test]
@@ -4583,7 +5081,7 @@ mod tests {
         // MCP query path never surface the raw secret either).
         let hits = store
             .reader
-            .search_pages("REDACTED".into(), 5)
+            .search_pages("REDACTED".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -4663,7 +5161,11 @@ mod tests {
         }
         let counts = store.reader.status_counts().await.unwrap();
         assert_eq!(counts.pages_latest, 5);
-        let hits = store.reader.search_pages("batch".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("batch".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 5);
     }
 
@@ -4834,7 +5336,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("REDACTED".into(), 5)
+            .search_pages("REDACTED".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -5341,6 +5843,7 @@ mod tests {
                 None,
                 false,
                 ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
             )
             .await
             .unwrap();
@@ -5567,7 +6070,7 @@ mod tests {
         );
         let hits = s2
             .reader
-            .search_pages("uniquetoken".into(), 5)
+            .search_pages("uniquetoken".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -6030,7 +6533,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages("consolidated".into(), 10)
+                .search_pages("consolidated".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -6079,7 +6582,7 @@ mod tests {
         assert!(
             !store
                 .reader
-                .search_pages("kept".into(), 10)
+                .search_pages("kept".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty(),

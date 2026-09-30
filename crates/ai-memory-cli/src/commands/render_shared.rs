@@ -188,6 +188,21 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
 /// repository with no `.ai-memory.toml` marker must emit nothing — mirroring
 /// the native admit gate in `commands/hook.rs` (`repository_admits_capture`)
 /// — so the check runs before any disposition logic, for every event kind.
+///
+/// Ahead of even that marker scan sits the external-ownership gate: when
+/// `AI_MEMORY_CAPTURE_OWNER` holds any value that is non-empty after trimming,
+/// `capturePolicy` returns `drop` immediately, so a generated consumer never
+/// queues, spools, or POSTs a *new* capture event. It mirrors the native gate
+/// in `commands/hook.rs` and leaves handoff fetching untouched, which is the
+/// whole point: an external producer replaces capture without losing native
+/// context delivery.
+///
+/// Two things it deliberately does not do. It does not suppress the consumer's
+/// routing work around the call (`applyMarkerParams` reads the marker before
+/// `capturePolicy` is even reached), and it does not erase an existing spool
+/// backlog: a consumer that reaches `drainHookQueue` — on dispose, for
+/// instance — still kicks off `requestSpoolDrain`, so events spooled before the
+/// handover can still be delivered.
 #[must_use]
 pub(crate) fn ts_capture_policy_v1(capture_mode: &str) -> String {
     const TEMPLATE: &str = r##"// capture-policy-v1 (generated; do not fork between adapters)
@@ -276,7 +291,7 @@ function captureGlobReaches(glob: string, prefix: string, insensitive: boolean, 
 // An argv element is one word as given and is also tokenized on its own
 // (`bash -lc "<script>"`); joining elements would re-split paths with spaces.
 // Elements over 256 chars are scripts, so only their tokens count.
-function captureShellCommand(args: Record<string, unknown> | undefined): string | string[] | undefined { if (!args || typeof args !== "object" || Array.isArray(args)) return undefined; const value = "command" in args ? args.command : args.cmd; if (typeof value === "string") return value; if (Array.isArray(value) && value.every((x) => typeof x === "string")) return value as string[]; return undefined; }
+function captureShellCommand(args: Record<string, unknown> | undefined): string | string[] | undefined { if (!args || typeof args !== "object" || Array.isArray(args)) return undefined; const value = "command" in args ? args.command : ("cmd" in args ? args.cmd : args.CommandLine); if (typeof value === "string") return value; if (Array.isArray(value) && value.every((x) => typeof x === "string")) return value as string[]; return undefined; }
 // Split only when a policy is active: this runs for every tool event.
 function captureShellWordList(command: string | string[]): string[] { if (typeof command === "string") return captureShellWords(command); return command.flatMap((item) => { const tokens = captureShellWords(item); return tokens.length === 1 && tokens[0] === item || [...item].length > 256 ? tokens : [item, ...tokens]; }); }
 function captureShellWords(command: string): string[] { const special = (c: string) => /\s/.test(c) || "|&;<>()".includes(c); const chars = [...command]; const words: string[] = []; let word = ""; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote) { if (c === quote) quote = ""; else if (quote === '"' && c === "\\" && (next === '"' || next === "\\")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (special(c)) { if (inWord) words.push(word); word = ""; inWord = false; } else { word += c; inWord = true; } } if (inWord) words.push(word); return words; }
@@ -285,8 +300,23 @@ function captureShellArguments(word: string): string[] { const out = word.starts
 // variables, command substitution, and `cd` state are not followed. A tool's
 // own `workdir` replaces the event cwd for relative arguments.
 function captureMatchCommand(command: string | string[], config: CaptureConfig, workdir?: string): boolean | undefined { const budget = { work: 0 }; const home = homedir(); const base = workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); for (const word of captureShellWordList(command)) for (const argument of captureShellArguments(word)) { const expanded = argument.startsWith("~/") ? captureJoin(home, argument.slice(2)) : argument; if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); if (!absolute && !base) continue; const candidate = captureNormalize(absolute ? expanded : captureJoin(base, expanded)); if (!candidate) continue; const glob = /[*?]/.test(candidate.path); for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const under = captureStartsWith(candidate.path, pattern.prefix, pattern.windows); if (!under && !glob) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, pattern.windows, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobReaches(candidate.path, pattern.prefix, pattern.windows, budget); if (reaches !== false) return reaches; } } } return false; }
-function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","terminal","execute_bash","execute_cmd"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && (tool.family === "file" || tool.shell)) disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } else if (config.state === "active" && tool.family === "non-file" && tool.command !== undefined && captureMatchCommand(tool.command, config, tool.workdir) !== false) disposition = "drop"; if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
+// An external lifecycle owner (`AI_MEMORY_CAPTURE_OWNER`, any value that is
+// non-empty after trimming) takes over capture for this process: the gate runs
+// before the capture-policy marker scan, so no disposition work, no marker read
+// by this policy, and no queue write, spool write, or capture POST downstream.
+// It does not reach the consumer's own routing work (`applyMarkerParams` runs
+// earlier in postHook), and context delivery (`fetchHandoff`) is a separate
+// path that stays live.
+function captureOwnedExternally(): boolean { const owner = typeof process === "undefined" ? undefined : process.env?.AI_MEMORY_CAPTURE_OWNER; return typeof owner === "string" && owner.trim() !== ""; }
+// Server profiles (`server = "<name>"`, #992) are routed only by the native
+// hook. Any marker up the tree that selects one makes this integration emit
+// nothing rather than deliver that repository's capture to the install default.
+// Mirrors the native walk: no payload cwd falls back to the process cwd; inside
+// home the walk stops at home, outside it continues past the checkout root to an
+// organisation-level marker; an unreadable marker counts as a selection.
+function captureServerRouted(cwd: string | undefined): boolean { let dir = resolve(cwd ?? process.cwd()); const home = homedir(); let boundary: string | undefined; for (let probe = dir; ; probe = dirname(probe)) { if (probe === home) { boundary = home; break; } if (probe === dirname(probe)) break; } for (;;) { try { if (/^\s*server\s*=/m.test(readFileSync(join(dir, ".ai-memory.toml"), "utf8"))) return true; } catch (e) { if (!["ENOENT", "ENOTDIR", "EISDIR"].includes((e as { code?: string })?.code ?? "")) return true; } if (dir === boundary || dir === dirname(dir)) return false; dir = dirname(dir); } }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && (tool.family === "file" || tool.shell)) disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } else if (config.state === "active" && tool.family === "non-file" && tool.command !== undefined && captureMatchCommand(tool.command, config, tool.workdir) !== false) disposition = "drop"; if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
 "##;
     TEMPLATE.replace("__AI_MEMORY_CAPTURE_MODE__", capture_mode)
 }
@@ -587,6 +617,80 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// comfortably covers a handoff plus a `[briefing]`-budgeted brief
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Hermes Agent lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
+///
+/// Verified against Hermes v0.21.4 (`agent/shell_hooks.py`): a configured
+/// `command` is split into argv by `shlex.split` and executed **without a
+/// shell**, with the event JSON on stdin — so the generated block invokes the
+/// native `hook` subcommand, the same shape Zero and ZCode use, and no
+/// `.sh`/`.ps1` bundle is staged. Only the two tool events are wired: their
+/// payload carries `tool_name` / `tool_input`, the envelope the router already
+/// maps for `agent=hermes`. Session lifecycle stays with the memory-provider
+/// plugin (`on_session_end`), so a hook-driven `session-end` cannot
+/// double-close a Hermes session.
+pub(crate) const HERMES_EVENTS: [(&str, &str); 2] = [
+    ("pre_tool_call", "pre-tool-use"),
+    ("post_tool_call", "post-tool-use"),
+];
+
+/// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
+/// fire-and-forget, so this only bounds a hung `hook` invocation.
+pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
+
+/// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
+///
+/// `command:` must be a bare argv line — Hermes splits it itself, so the
+/// `KEY=value script` prefix every shell-run harness gets would be parsed as
+/// extra argv entries. The native platform already emits the argv form
+/// (`<exe> [--data-dir …] hook --event … --agent hermes --server-url …`), and
+/// the YAML single-quote keeps any POSIX quoting inside it intact. ai-memory
+/// deliberately does not write the file: it is YAML the installer would have
+/// to splice, and Hermes gates user hooks behind its own acceptance prompt.
+#[must_use]
+pub(crate) fn build_hermes_hooks_yaml(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> String {
+    build_hermes_hooks_yaml_for_platform(
+        server_url,
+        auth_token,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_runner(),
+            "hermes",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// Platform-forced variant, so a test can pin POSIX/Windows instead of
+/// asserting whatever the machine running the suite happens to be.
+fn build_hermes_hooks_yaml_for_platform(
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let mut out = String::from("hooks:\n");
+    for (hermes_event, our_event) in HERMES_EVENTS {
+        // The native platforms derive the event token from the script stem, so
+        // the synthetic filename carries the ai-memory event name.
+        let command = hook_command(
+            Path::new(&format!("{our_event}.sh")),
+            server_url,
+            auth_token,
+            context,
+        );
+        out.push_str(&format!(
+            "  {hermes_event}:\n    - command: {}\n      timeout: {HERMES_HOOK_TIMEOUT_SECONDS}\n",
+            yaml_single_quote(&command)
+        ));
+    }
+    out
+}
 
 /// Devin hook payload for docker/setup-agent script snippets.
 /// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
@@ -1744,7 +1848,7 @@ fn to_git_bash_path(path: &str) -> String {
 /// command path. Leaves only conservative shell-safe characters unquoted;
 /// wraps everything else in single quotes and escapes embedded `'` via
 /// `'\''`.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| {
         c.is_ascii_alphanumeric()
             || matches!(c, '-' | '_' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ',')
@@ -1900,6 +2004,25 @@ function resolveToken(): string | null {
 "#
 }
 
+/// `timeoutSignal`, shared by every generated TypeScript integration: a
+/// request deadline composed with `hookAbort`. A host that tears its capture
+/// state down aborts `hookAbort` once its final deliveries had their drain
+/// budget (OpenCode 2 on each location's unload), so whatever is still in
+/// flight fails over to the spool at once instead of each waiting out its own
+/// timeout. The module-level integrations never abort it.
+pub(crate) fn ts_timeout_signal() -> &'static str {
+    r#"const hookAbort = new AbortController();
+
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  if (typeof AbortSignal === "undefined") return undefined;
+  const factory = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout;
+  const anyFactory = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (!factory) return hookAbort.signal;
+  return anyFactory ? anyFactory([hookAbort.signal, factory(ms)]) : factory(ms);
+}
+"#
+}
+
 pub(crate) fn ts_spool_runtime() -> &'static str {
     r#"
 // ---- offline spool (#580): the same on-disk contract as `ai-memory hook` ----
@@ -1919,6 +2042,11 @@ function hookSpoolDir(): string {
   return join(base, "hook-spool");
 }
 
+// A random prefix per copy of this state keeps two copies in one process
+// (OpenCode 2 location instances, OMP and Pi loading each other's extension)
+// from renaming onto each other's same-millisecond entry; the counter keeps
+// one copy's entries in order.
+const spoolSeqPrefix = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0");
 let spoolSeq = 0;
 
 function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): void {
@@ -1941,7 +2069,7 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
       ...(token ? { token } : {}),
       attempts: 0,
     };
-    const seq = (spoolSeq++ & 0xffffffff).toString(16).padStart(16, "0");
+    const seq = spoolSeqPrefix + (spoolSeq++ & 0xffffffff).toString(16).padStart(8, "0");
     const name = `${String(createdMs).padStart(13, "0")}-${process.pid}-${seq}.json`;
     const tmp = join(dir, `${name}.tmp`);
     writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
@@ -2001,6 +2129,60 @@ async function drainHookSpool(): Promise<void> {
 }
 
 "#
+}
+
+/// `Some(())` when this machine can execute the emitted TypeScript.
+/// Node is not a build dependency of this project, so a box without it
+/// (or on a Node too old for type stripping) skips the runtime evidence
+/// instead of failing.
+#[cfg(test)]
+pub(crate) fn node_strip_types_available() -> Option<()> {
+    let probe = std::process::Command::new("node")
+        .args(["--experimental-strip-types", "--version"])
+        .output();
+    match probe {
+        Ok(output) if output.status.success() => Some(()),
+        _ => {
+            eprintln!(
+                "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
+            );
+            None
+        }
+    }
+}
+
+/// Two copies of the spool state in one process (OpenCode 2 location
+/// instances, OMP and Pi sharing an extensions dir) must not write the
+/// same file name in the same millisecond, and every request deadline
+/// must compose with the state's abort signal.
+#[cfg(test)]
+pub(crate) fn assert_shared_ts_delivery_runtime(name: &str, source: &str) {
+    assert!(
+        source.contains("const spoolSeqPrefix = Math.floor(Math.random() * 0x100000000)"),
+        "{name}: spool names need a per-state random prefix"
+    );
+    assert!(
+        source.contains(
+            "const seq = spoolSeqPrefix + (spoolSeq++ & 0xffffffff).toString(16).padStart(8, \"0\");"
+        ),
+        "{name}: spool seq must stay 16 hex digits"
+    );
+    assert_eq!(
+        source
+            .matches("const hookAbort = new AbortController();")
+            .count(),
+        1,
+        "{name}"
+    );
+    assert_eq!(
+        source.matches("function timeoutSignal(").count(),
+        1,
+        "{name}"
+    );
+    assert!(
+        source.contains("anyFactory([hookAbort.signal, factory(ms)])"),
+        "{name}: request deadlines must also honour hookAbort"
+    );
 }
 
 #[cfg(test)]
@@ -2081,13 +2263,9 @@ mod tests {
     #[test]
     #[ignore = "needs Node >= 22.6; CI runs it with --ignored"]
     fn generated_capture_policy_v1_node_runtime_evidence() {
-        let strip_types = Command::new("node")
-            .args(["--experimental-strip-types", "--version"])
-            .output();
-        assert!(
-            strip_types.is_ok_and(|output| output.status.success()),
-            "Node runtime evidence needs node with --experimental-strip-types (Node >= 22.6)"
-        );
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
 
         let temp = tempfile::tempdir().unwrap();
         let module = temp.path().join("capture-policy-runtime-evidence.ts");
@@ -2206,6 +2384,20 @@ const inactive = capturePolicy(inactivePayload, "/no-marker");
 check(inactive.disposition === "keep" && inactive.payload === inactivePayload && !inactive.protocol, "inactive-preserves-object");
 const activeKeep = capturePolicy({{ tool: "bash", args: {{ command: privateBody }} }}, gatedCwd);
 check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 && activeKeep.protocol.policy_state === "active", "active-keep-adds-protocol");
+// #992: only the native hook routes `server` profiles; these integrations
+// must drop rather than deliver a routed repository to the install default,
+// including under a nested marker that does not repeat the key.
+check(capturePolicy(bash("echo hi"), marker('server = "team-b"\n')).disposition === "drop", "server-routed-drops");
+check(capturePolicy(bash("echo hi"), marker("server = team-b\n")).disposition === "drop", "server-routed-bare-drops");
+check(capturePolicy(bash("echo hi"), marker('servers = "x"\n')).disposition === "keep", "servers-key-is-not-server");
+const routedRoot = join(markerRoot, "routed-repo");
+const routedChild = join(routedRoot, "child");
+mkdirSync(join(routedRoot, ".git"), {{ recursive: true }});
+mkdirSync(routedChild, {{ recursive: true }});
+writeFileSync(join(routedRoot, ".ai-memory.toml"), 'server = "team-b"\n');
+writeFileSync(join(routedChild, ".ai-memory.toml"), 'workspace = "child"\n');
+markerFixtures.set(routedChild, join(routedChild, ".ai-memory.toml"));
+check(capturePolicy(bash("echo hi"), routedChild).disposition === "drop", "server-routed-inherited-drops");
 "#,
             fixture = fixture,
             policy = ts_capture_policy_v1("denylist"),
@@ -2294,6 +2486,102 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
             String::from_utf8_lossy(&allowlist_output.stdout),
             String::from_utf8_lossy(&allowlist_output.stderr),
         );
+    }
+
+    /// `AI_MEMORY_CAPTURE_OWNER` hands capture to an external producer: the
+    /// generated `capturePolicy` must drop before it even looks for a marker.
+    /// Executed against the real emitted TypeScript rather than a hand-kept
+    /// copy, and cheap enough (three short Node runs, no fixtures) to stay in
+    /// the default tier instead of joining the manual evidence test above.
+    #[test]
+    fn generated_capture_policy_gates_on_external_capture_owner() {
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
+        // `keep()` cancels delete-on-drop: the emitted modules are the
+        // evidence, so they stay on disk for inspection after the run.
+        let temp = tempfile::tempdir().unwrap().keep();
+        eprintln!("capture-owner gate modules retained at {}", temp.display());
+        const HARNESS: &str = r#"import { closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+
+const markerRoot = process.argv[2]!;
+const inheritOnly = process.argv[3] === "inherit";
+let markerScans = 0;
+const repo = join(markerRoot, "repo");
+mkdirSync(repo, { recursive: true });
+const markerFile = join(repo, ".ai-memory.toml");
+writeFileSync(markerFile, '[capture]\nignore_paths = ["secret/**"]\n');
+function findMarker(cwd: string | undefined): string | undefined { markerScans++; return cwd === repo ? markerFile : undefined; }
+__AI_MEMORY_POLICY__
+
+function fail(label: string): never { throw new Error(`external-owner gate failed: ${label}`); }
+function check(ok: unknown, label: string): asserts ok { if (!ok) fail(label); }
+
+function probe(label: string, owned: boolean): void {
+  markerScans = 0;
+  const payload = { tool: "edit", args: { path: "public/item" } };
+  const result = capturePolicy(payload, repo);
+  if (owned) {
+    check(result.disposition === "drop", `${label} disposition`);
+    // Before the capture-policy marker scan: no disk read by the policy, no
+    // disposition work, and the payload comes back untouched so nothing
+    // downstream can queue it.
+    check(markerScans === 0, `${label} marker scan`);
+    check(result.protocol === undefined, `${label} protocol`);
+    check(result.payload === payload, `${label} payload identity`);
+  } else {
+    check(result.disposition === "keep", `${label} disposition`);
+    check(markerScans > 0, `${label} marker scan`);
+    check(result.protocol?.policy_state === "active", `${label} protocol`);
+  }
+}
+
+if (inheritOnly) {
+  // The value really arrived through the process environment, not a mutation
+  // this harness made.
+  check((process.env.AI_MEMORY_CAPTURE_OWNER ?? "").trim() !== "", "inherited owner missing");
+  probe("inherited-owner", true);
+} else {
+  for (const [value, owned] of [[undefined, false], ["", false], [" \t\n", false], ["orchestrator-a", true], ["  orchestrator-a  ", true]] as [string | undefined, boolean][]) {
+    if (value === undefined) delete process.env.AI_MEMORY_CAPTURE_OWNER;
+    else process.env.AI_MEMORY_CAPTURE_OWNER = value;
+    probe(`owner=${JSON.stringify(value)}`, owned);
+  }
+}
+"#;
+
+        for (mode, inherit) in [("denylist", false), ("denylist", true), ("allowlist", true)] {
+            let module = temp.join(format!(
+                "capture-owner-{mode}-{}.ts",
+                if inherit { "inherit" } else { "matrix" }
+            ));
+            fs::write(
+                &module,
+                HARNESS.replace("__AI_MEMORY_POLICY__", &ts_capture_policy_v1(mode)),
+            )
+            .unwrap();
+            let mut command = Command::new("node");
+            command.args([
+                "--experimental-strip-types",
+                module.to_str().unwrap(),
+                temp.to_str().unwrap(),
+                if inherit { "inherit" } else { "matrix" },
+            ]);
+            if inherit {
+                command.env("AI_MEMORY_CAPTURE_OWNER", "orchestrator-a");
+            } else {
+                command.env_remove("AI_MEMORY_CAPTURE_OWNER");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "capture-owner gate evidence failed (mode={mode}, inherit={inherit})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
@@ -2723,6 +3011,56 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
         assert_eq!(command, r"C:\Program Files\ai-memory\ai-memory.exe");
         assert_eq!(args[1], r"C:\Data\ai-memory");
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
+    }
+
+    /// The public entry point must emit a complete `hooks:` map with both tool
+    /// events, whatever platform it renders for (the suite runs on Windows too).
+    #[test]
+    fn hermes_hooks_yaml_covers_both_tool_events() {
+        let yaml = build_hermes_hooks_yaml("http://127.0.0.1:49374", None, None, None);
+        assert!(yaml.starts_with("hooks:\n"));
+        for (event, _) in HERMES_EVENTS {
+            assert!(yaml.contains(&format!("  {event}:\n")), "missing {event}");
+            assert!(
+                yaml.contains("    - command: '"),
+                "command must be a single-quoted YAML scalar"
+            );
+        }
+        assert_eq!(
+            yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
+                .count(),
+            HERMES_EVENTS.len()
+        );
+    }
+
+    /// Hermes splits `command` with `shlex.split` and runs it with no shell, so
+    /// the generated line must be bare argv: a `KEY=value` prefix would be
+    /// parsed as extra argv entries and the hook would never reach the server.
+    #[test]
+    fn hermes_hooks_yaml_invokes_the_native_command_without_a_shell() {
+        let yaml = build_hermes_hooks_yaml_for_platform(
+            "http://127.0.0.1:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::PosixNative,
+                "hermes",
+                Some(Path::new("/data")),
+                Some("repo-root"),
+            ),
+        );
+        for (_, our_event) in HERMES_EVENTS {
+            assert!(
+                yaml.contains(&format!("hook --event {our_event} --agent hermes")),
+                "missing the native command for {our_event}"
+            );
+        }
+        assert!(
+            !yaml.contains("AI_MEMORY_HOOK_URL="),
+            "an env prefix would be parsed as argv, not environment"
+        );
+        assert!(yaml.contains("--data-dir /data"));
+        assert!(yaml.contains("--server-url http://127.0.0.1:49374"));
+        assert!(yaml.contains("--project-strategy repo-root"));
     }
 
     fn exec_args(script: &str, capture_assistant: bool) -> Vec<String> {

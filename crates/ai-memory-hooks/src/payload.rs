@@ -89,6 +89,14 @@ pub struct HookQuery {
     /// `.ai-memory.toml` named it, `repo-root` when the host hook derived it
     /// from the enclosing checkout. Absent on older clients (#394).
     pub project_src: Option<String>,
+    /// Repository identity the client resolved for this checkout (#708):
+    /// an explicit marker `identity`, or a normalised git remote. Paired
+    /// with `identity_src`. Absent on older clients and for checkouts that
+    /// declare a `project`, which keep routing by name.
+    pub identity: Option<String>,
+    /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
+    /// else, or a malformed identity, is ignored and the event routes by name.
+    pub identity_src: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -117,6 +125,10 @@ pub struct HookEnvelope {
     /// Where `project_override` came from. Always [`ProjectSource::Unspecified`]
     /// when there is no override, so the two can never disagree (#394).
     pub project_source: ProjectSource,
+    /// Repository identity from the client, already validated by
+    /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
+    /// routes by project name, as every event did before identities existed.
+    pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -170,6 +182,7 @@ impl std::fmt::Debug for HookEnvelope {
             .field("workspace_override", &self.workspace_override)
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
+            .field("identity", &self.identity)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -444,7 +457,7 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
@@ -519,6 +532,12 @@ impl HookEnvelope {
         } else {
             ProjectSource::Unspecified
         };
+        let identity = match (query.identity.as_deref(), query.identity_src.as_deref()) {
+            (Some(identity), Some(source)) => {
+                ai_memory_core::repository_identity::accept_wire_identity(identity, source)
+            }
+            _ => None,
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -537,6 +556,9 @@ impl HookEnvelope {
         } else {
             None
         };
+        if agent == AgentKind::AntigravityCli {
+            crate::antigravity::enrich_antigravity_step_output(&mut raw, event, None);
+        }
         let tool_metadata = tool_observation_metadata(agent, &raw, event == HookEvent::PreToolUse);
         let closed_tool_event = matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse)
             && closed_tool_agent(agent);
@@ -599,6 +621,7 @@ impl HookEnvelope {
             project_override,
             project_strategy,
             project_source,
+            identity,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,
@@ -2932,6 +2955,69 @@ mod tests {
             }),
         );
         assert!(notification.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_extracts_output_txt_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir
+            .path()
+            .join(".system_generated")
+            .join("steps")
+            .join("42");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "cargo test: 10 passed\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "cargo test"}
+                },
+                "stepIdx": 42,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("tool_family: non-file"));
+        assert!(body.contains("cargo test: 10 passed"));
+    }
+
+    #[test]
+    fn antigravity_post_tool_use_preserves_edit_tool_code_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_dir = dir.path().join(".system_generated").join("steps").join("1");
+        std::fs::create_dir_all(&step_dir).unwrap();
+        std::fs::write(step_dir.join("output.txt"), "Created file test.rs\n").unwrap();
+
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversationId": "conv-1",
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "TargetFile": "/workspace/test.rs",
+                        "CodeContent": "fn preserved_code() {}"
+                    }
+                },
+                "stepIdx": 1,
+                "artifactDirectoryPath": dir.path().to_str().unwrap()
+            }),
+        );
+        let body = env.body_excerpt.expect("body excerpt should be present");
+        assert!(body.contains("fn preserved_code() {}"));
+        assert!(!body.contains("Created file test.rs"));
     }
 
     #[test]

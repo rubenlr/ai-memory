@@ -793,9 +793,10 @@ fn family(name: &str) -> ToolFamily {
         | "fs_write" => ToolFamily::File,
         "read_file" | "write_file" | "edit_file" | "patch" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
-        | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
+        | "list_dir" | "grep_search" | "search_files" | "find_by_name" => ToolFamily::SearchList,
         "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
-        | "terminal" | "execute_bash" | "execute_cmd" => ToolFamily::NonFile,
+        | "search_web" | "manage_task" | "manage_subagents" | "terminal" | "execute_bash"
+        | "execute_cmd" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -926,7 +927,11 @@ impl ShellCommand<'_> {
 }
 
 fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
-    match args.get("command").or_else(|| args.get("cmd"))? {
+    match args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .or_else(|| args.get("CommandLine"))?
+    {
         Value::String(command) => Some(ShellCommand::Line(command)),
         Value::Array(items) => items
             .iter()

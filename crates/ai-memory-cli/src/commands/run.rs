@@ -9,15 +9,19 @@ use std::time::{Duration, SystemTime};
 use ai_memory_core::{
     AgentKind, FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
     ManagedRunContextResponse, ManagedRunStatus, PrepareManagedRunRequest,
-    PrepareManagedRunResponse,
+    PrepareManagedRunResponse, SessionId,
 };
 use ai_memory_workstream::{
-    ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
-    allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, has_native_session_selector, inspect_repository, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    native_session_exists, native_session_in_checkout, wait_for_transcript_flush,
+    AmbiguousNativeSession, ExportedTranscript, FORWARDED_ENV_NAMES, LaunchMode, LaunchPlan,
+    LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_on_path,
+    allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
+    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
+    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
+    inspect_repository, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    kiro_v3_resume_uses_default_store, list_native_sessions, native_session_exists,
+    native_session_in_checkout, omp_profile_flag, omp_profile_flag_env, store_override_vars,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -99,8 +103,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
 /// installers resolve their real per-agent paths — behavior is byte-identical to
 /// the inlined call this replaced. The overrides exist only so the `run` →
 /// autowire → child-spawn seam can be exercised without writing to the
-/// developer's real `$HOME`, mirroring the `ensure_wired` / `ensure_wired_with`
-/// split.
+/// developer's real `$HOME`.
 pub(super) async fn run_from_with_wiring(
     config: &Config,
     args: RunArgs,
@@ -114,8 +117,11 @@ pub(super) async fn run_from_with_wiring(
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
+    let yolo_requested = args.yolo || trailing_yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let no_autowire = args.no_autowire || trailing_no_autowire;
+    let mut run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
+        .context("resolving --env/--env-file for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -239,14 +245,20 @@ pub(super) async fn run_from_with_wiring(
         resolved_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
-    // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
-    // here, so managed launch "just works" for capture and recall without a
-    // manual install step. One-time, idempotent, best-effort (it never blocks or
-    // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
-    // Runs before the child spawns so the harness picks up the fresh hooks.
-    if config.run_autowire && !no_autowire {
-        super::run_autowire::ensure_wired_with(config, harness, wire_overrides);
-    }
+    // Warn, and offer ai-jail, before any further native-session work — a
+    // yolo re-exec under ai-jail must forward the original argv, not the
+    // resolved launch plan, and restarting cleanly under ai-jail before
+    // session adoption/linking begins keeps that linking simple (#16: this
+    // sits around session-identity resolution, not inside it).
+    acquired_try!(
+        confirm_yolo_and_maybe_reexec(
+            yolo_requested,
+            &endpoint,
+            &run_path,
+            &interrupted_before_spawn,
+        )
+        .await
+    );
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
@@ -256,6 +268,7 @@ pub(super) async fn run_from_with_wiring(
         force_fresh,
         &home,
         &repository.cwd,
+        &run_env,
     ));
     if let Some(orphaned_session) = orphaned_session {
         eprintln!(
@@ -282,11 +295,16 @@ pub(super) async fn run_from_with_wiring(
                 .find(|candidate| candidate.harness == harness)
                 .context("the selected automatic harness no longer has a checkout-local session")
         );
-        plan = acquired_try!(build_launch_plan(
+        plan = acquired_try!(build_launch_plan_with_env(
             harness,
             executable.clone(),
             native_args.clone(),
             Some(&candidate.session.native_session_id),
+            &run_env,
+            Some(LaunchRoots {
+                home: &home,
+                cwd: &repository.cwd,
+            }),
         ));
         eprintln!(
             "ai-memory: continuing newest checkout-local {} session {}",
@@ -324,11 +342,16 @@ pub(super) async fn run_from_with_wiring(
                 );
                 match selection {
                     Ok(Some(native_session_id)) => {
-                        plan = acquired_try!(build_launch_plan(
+                        plan = acquired_try!(build_launch_plan_with_env(
                             harness,
                             executable,
                             native_args,
                             Some(&native_session_id),
+                            &run_env,
+                            Some(LaunchRoots {
+                                home: &home,
+                                cwd: &repository.cwd,
+                            }),
                         ));
                     }
                     Ok(None) => {}
@@ -345,7 +368,7 @@ pub(super) async fn run_from_with_wiring(
             ),
         }
     }
-    if args.yolo || trailing_yolo {
+    if yolo_requested {
         // Kiro's official dangerous mode exists on the v2 engine only
         // (`--trust-all-tools`); the v3 engine replaced it with
         // permissions.yaml and documents no CLI equivalent, so the wrapper
@@ -359,6 +382,19 @@ pub(super) async fn run_from_with_wiring(
             );
         }
         apply_yolo(harness, &mut plan.args);
+    }
+    // Claude-only "true yolo": opt-in, independent of `--yolo` (see
+    // `docs/design-yolo-safety-ai-jail.md` §4). Applied to the same
+    // env/args the child command is built from below.
+    if args.true_yolo || config.claude_true_yolo {
+        if harness == ManagedHarness::Claude {
+            apply_claude_true_yolo(harness, &mut run_env, &mut plan.args);
+        } else if args.true_yolo {
+            eprintln!(
+                "ai-memory: --true-yolo only affects the Claude harness; ignoring it for {}",
+                harness.as_str()
+            );
+        }
     }
     let remove_kiro_home = if harness == ManagedHarness::KiroV3
         && let Some(native_session_id) = plan.expected_session_id.as_deref()
@@ -377,6 +413,34 @@ pub(super) async fn run_from_with_wiring(
             "ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"
         );
     }
+    // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
+    // here, so managed launch "just works" for capture and recall without a
+    // manual install step. One-time, idempotent, best-effort (it never blocks or
+    // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
+    // Runs once the session and its store are settled, so it wires the config
+    // home the child will read, and before the child spawns so the harness
+    // picks up the fresh hooks.
+    // The environment the child runs with: `--env` over ai-memory's own.
+    let launch_env = |name: &str| {
+        run_env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| std::env::var_os(name))
+    };
+    if config.run_autowire && !no_autowire {
+        // A Kiro v3 resume from the default store drops `KIRO_HOME` from the
+        // child, so its hooks and MCP belong under the default home.
+        let mut wire_env = autowire_env(harness, &run_env, &plan.args, &launch_env);
+        if remove_kiro_home {
+            upsert_env(
+                &mut wire_env,
+                "KIRO_HOME".to_string(),
+                home.join(".kiro").display().to_string(),
+            );
+        }
+        super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
+    }
     if plan.mode == LaunchMode::Session
         && let Some(native_session_id) = &plan.expected_session_id
     {
@@ -394,7 +458,8 @@ pub(super) async fn run_from_with_wiring(
     }
 
     let crush_context = if harness == ManagedHarness::Crush && plan.mode == LaunchMode::Session {
-        acquired_try!(prepare_crush_context(&endpoint, &run_path, &home).await)
+        let source = crush_context_source(&home, &repository.cwd, launch_env);
+        acquired_try!(prepare_crush_context(&endpoint, &run_path, &source).await)
     } else {
         None
     };
@@ -430,9 +495,13 @@ pub(super) async fn run_from_with_wiring(
     // unresolvable program reaching the spawn error below, which explains it.
     let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
     let mut command = Command::new(&program);
+    command.args(&plan.args).current_dir(&repository.cwd);
+    // Caller-supplied `--env`/`--env-file` entries go first so the fixed
+    // AI_MEMORY_* plumbing below always wins on a key collision.
+    for (key, value) in &run_env {
+        command.env(key, value);
+    }
     command
-        .args(&plan.args)
-        .current_dir(&repository.cwd)
         .env("AI_MEMORY_RUN_ID", prepared.run_id.to_string())
         .env(
             "AI_MEMORY_WORKSTREAM_ID",
@@ -442,6 +511,13 @@ pub(super) async fn run_from_with_wiring(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // A blank home override is unset for session import, auto-wire and the
+    // Crush context config; drop it from the child as well, or the harness
+    // would read a blank-named directory under the checkout that nothing else
+    // follows.
+    for name in blank_home_overrides(harness, &launch_env) {
+        command.env_remove(name);
+    }
     if remove_kiro_home {
         command.env_remove("KIRO_HOME");
     }
@@ -518,6 +594,33 @@ pub(super) async fn run_from_with_wiring(
     } else {
         None
     };
+    let own_session_id = match own_native_session(
+        &plan,
+        harness,
+        &home,
+        &repository.cwd,
+        server_status.as_ref(),
+    ) {
+        Ok(own) => own,
+        Err(error) => {
+            // Only a linked session is checked, so the server reported its id.
+            if harness.lacks_session_end_hook()
+                && let Some(linked) = server_status
+                    .as_ref()
+                    .and_then(|status| status.native_session_id.as_deref())
+            {
+                eprintln!(
+                    "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
+                    harness.as_str(),
+                    harness.agent_kind().as_str(),
+                    SessionId::from_native(linked),
+                    super::render_shared::shell_quote(&workspace),
+                    super::render_shared::shell_quote(&project)
+                );
+            }
+            None
+        }
+    };
     let native_session_id = acquired_try!(
         resolve_native_session_after_run(
             &plan,
@@ -575,7 +678,79 @@ pub(super) async fn run_from_with_wiring(
         prepared.workstream_name
     );
     interrupt_task.abort();
+    if let Some((session, finalized)) = finalize_hookless_session(
+        config,
+        harness,
+        own_session_id.as_deref(),
+        &workspace,
+        &project,
+    )
+    .await
+    {
+        let agent = harness.agent_kind().as_str();
+        match finalized {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!("ai-memory: finalized the {agent} session {session}");
+            }
+            // No session under that id for this agent and owner in this
+            // scope: its hooks are not installed or never fired, or they
+            // filed it under another workspace/project.
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                super::render_shared::shell_quote(&workspace),
+                super::render_shared::shell_quote(&project)
+            ),
+        }
+    }
     Ok(exit_code)
+}
+
+/// How long finalizing may hold up the harness's exit code.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Finalizes the run's own session when the harness has no native session-end
+/// hook, which would otherwise leave it open until a manual
+/// `ai-memory finalize-session` (#941). The harness has exited, so the session
+/// is over for this run.
+/// Returns the stored session id and the ids finalized, or `None` when there
+/// is nothing to do.
+async fn finalize_hookless_session(
+    config: &Config,
+    harness: ManagedHarness,
+    own_session_id: Option<&str>,
+    workspace: &str,
+    project: &str,
+) -> Option<(SessionId, Result<Vec<String>>)> {
+    let native_session_id = own_session_id?;
+    if !harness.lacks_session_end_hook() {
+        return None;
+    }
+    let session = SessionId::from_native(native_session_id);
+    let args = crate::cli::FinalizeSessionArgs {
+        agent: harness.agent_kind(),
+        workspace: Some(workspace.to_string()),
+        project: Some(project.to_string()),
+        all_owners: false,
+        all: false,
+        session_id: Some(session),
+        // These harnesses keep capturing under the same id when a session is
+        // resumed, so a later run must be able to end it again. A re-end
+        // with nothing new since the last one changes nothing on the server.
+        reopen: true,
+        json: false,
+    };
+    // Tokio keeps SIGINT once it has been captured, so listen afresh: Ctrl-C
+    // skips a slow finalize instead of being dropped.
+    let finalized = tokio::select! {
+        finalized = tokio::time::timeout(
+            FINALIZE_TIMEOUT,
+            super::finalize_session::finalize(config, &args),
+        ) => finalized
+            .unwrap_or_else(|_| Err(anyhow!("timed out after {}s", FINALIZE_TIMEOUT.as_secs()))),
+        Ok(()) = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
+    };
+    Some((session, finalized.map(|(_, _, ids)| ids)))
 }
 
 async fn capture_interrupts(interrupted: CancellationToken) {
@@ -635,6 +810,189 @@ async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &
     }
 }
 
+/// Whether a `--yolo` launch should warn (and offer ai-jail) before spawning
+/// the agent: `--yolo` was actually requested, both `stdin` and `stderr` are
+/// real terminals (mirrors the native-session-picker gate), and we are not
+/// already running inside ai-jail. `jailed` failing open to `false` (see
+/// [`ai_memory_workstream::inside_ai_jail`]) means an undetectable sandbox
+/// still shows the warning rather than silently skipping it.
+fn should_prompt_yolo(yolo: bool, stdin_tty: bool, stderr_tty: bool, jailed: bool) -> bool {
+    yolo && stdin_tty && stderr_tty && !jailed
+}
+
+/// A confirmation line's yes/no verdict: `Enter`/empty, `y`, or `yes`
+/// (case-insensitive) proceed; only an explicit `n`/`no` declines. Anything
+/// else also proceeds — this is a `[Y/n]` prompt, not a strict allowlist.
+fn yolo_decision(confirmed_line: &str) -> bool {
+    !matches!(
+        confirmed_line.trim().to_ascii_lowercase().as_str(),
+        "n" | "no"
+    )
+}
+
+/// The two yes/no answers `read_yolo_confirmation` can return: whether to
+/// proceed with `--yolo` at all, and, only when ai-jail is offered, whether
+/// to re-exec under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YoloConfirmation {
+    proceed: bool,
+    jail: bool,
+}
+
+/// Print the `--yolo` warning (docs/design-yolo-safety-ai-jail.md §1), and
+/// the ai-jail offer when available (§2), then read the confirming line(s).
+/// `input`/`output` are injected so the wording and default-yes semantics
+/// are unit-tested without a real terminal.
+fn read_yolo_confirmation(
+    ai_jail_available: bool,
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+) -> io::Result<YoloConfirmation> {
+    writeln!(
+        output,
+        "⚠  --yolo runs every tool call with no confirmation. An agent can delete"
+    )?;
+    writeln!(
+        output,
+        "   files, run any command, and reach the network unsupervised."
+    )?;
+    write!(output, "   Proceed? [Y/n] ")?;
+    output.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    if !yolo_decision(&line) {
+        return Ok(YoloConfirmation {
+            proceed: false,
+            jail: false,
+        });
+    }
+    if !ai_jail_available {
+        return Ok(YoloConfirmation {
+            proceed: true,
+            jail: false,
+        });
+    }
+    write!(
+        output,
+        "ai-jail is installed. Re-run this session inside it? [Y/n] "
+    )?;
+    output.flush()?;
+    let mut jail_line = String::new();
+    input.read_line(&mut jail_line)?;
+    Ok(YoloConfirmation {
+        proceed: true,
+        jail: yolo_decision(&jail_line),
+    })
+}
+
+/// The interactive `--yolo` gate (docs/design-yolo-safety-ai-jail.md). A
+/// no-op outside a real TTY, when `--yolo` was not requested, or when already
+/// inside ai-jail. On confirmation it either returns (unjailed, or the user
+/// declined the ai-jail offer) or, on accepting the offer, cancels this
+/// process's already-prepared managed run and re-execs the original
+/// invocation under `ai-jail` — which never returns on success.
+async fn confirm_yolo_and_maybe_reexec(
+    yolo_requested: bool,
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    interrupted: &CancellationToken,
+) -> Result<()> {
+    let jailed = inside_ai_jail_here();
+    if !should_prompt_yolo(
+        yolo_requested,
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+        jailed,
+    ) {
+        return Ok(());
+    }
+    if interrupted.is_cancelled() {
+        return Err(anyhow!("managed run interrupted before the agent started"));
+    }
+    let ai_jail_available = ai_jail_on_path();
+    let confirmation = tokio::task::spawn_blocking(move || {
+        let stdin = io::stdin();
+        let mut stderr = io::stderr();
+        read_yolo_confirmation(ai_jail_available, &mut stdin.lock(), &mut stderr)
+    })
+    .await
+    .context("waiting for the --yolo confirmation")?
+    .context("reading the --yolo confirmation from stdin")?;
+    if !confirmation.proceed {
+        return Err(anyhow!("aborted: --yolo not confirmed"));
+    }
+    if !confirmation.jail {
+        return Ok(());
+    }
+    // The re-exec replaces this process (or, off Unix, this process exits
+    // once the child does), so its own prepared lease must be released here
+    // rather than left to the 90s orphan timeout — the jailed re-run opens
+    // its own workstream cleanly.
+    cancel_managed_run_after_failure(endpoint, run_path).await;
+    let exe = std::env::current_exe()
+        .context("resolving the current executable for the ai-jail re-exec")?;
+    let forwarded: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let present: Vec<&str> = FORWARDED_ENV_NAMES
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    // `--agent-state` is a bare toggle: enable it so the harness's own login
+    // state survives ai-jail's ephemeral private home (ai-jail derives the
+    // per-harness state location from the wrapped `run <harness>` it parses).
+    let jail_args = build_ai_jail_invocation(&exe, &forwarded, &present, true);
+    reexec_under_ai_jail(&jail_args)
+}
+
+/// Replace this process with `ai-jail <jail_args>` on Unix (never returns on
+/// success); elsewhere, spawn it, wait, and exit with its status (also never
+/// returns).
+#[cfg(unix)]
+fn reexec_under_ai_jail(jail_args: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let error = std::process::Command::new("ai-jail").args(jail_args).exec();
+    Err(anyhow!("{error}")).context("re-executing under ai-jail")
+}
+
+#[cfg(not(unix))]
+fn reexec_under_ai_jail(jail_args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new("ai-jail")
+        .args(jail_args)
+        .status()
+        .context("spawning ai-jail")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The session this run can prove is its own: the one it launched or resumed,
+/// or the one its child linked under the run's id. A concurrent launch in the
+/// same checkout cannot link under this run's id, while discovery can only
+/// guess from timing. A descendant process inherits the id too, so the linked
+/// session must also be this checkout's.
+fn own_native_session(
+    plan: &LaunchPlan,
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    server_status: Option<&ManagedRunStatus>,
+) -> Result<Option<String>> {
+    if plan.mode == LaunchMode::Passthrough {
+        return Ok(None);
+    }
+    if let Some(native_session_id) = &plan.expected_session_id {
+        return Ok(Some(native_session_id.clone()));
+    }
+    let Some(linked) = server_status
+        .filter(|status| status.native_session_linked)
+        .and_then(|status| status.native_session_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let in_checkout =
+        native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
+            .with_context(|| format!("reading native session {linked}"))?;
+    Ok(in_checkout.then(|| linked.to_string()))
+}
+
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
@@ -646,27 +1004,36 @@ async fn resolve_native_session_after_run(
     if plan.mode == LaunchMode::Passthrough {
         return Ok(None);
     }
-    if let Some(native_session_id) = &plan.expected_session_id {
-        return Ok(Some(native_session_id.clone()));
+    if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status) {
+        return Ok(Some(own));
     }
-    // A session linked under this run's id was reported by this run's child,
-    // which a concurrent launch in the same checkout cannot do; discovery
-    // only sees the newest session there. A descendant process inherits the
-    // id too, so the session must also be this checkout's.
     let linked = server_status
         .filter(|status| status.native_session_linked)
         .and_then(|status| status.native_session_id.as_deref());
-    if let Some(linked) = linked
-        && native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
-            .unwrap_or(false)
+    let fresh = !has_native_session_selector(harness, &plan.args);
+    let discovered = match discover_native_session(
+        harness,
+        home,
+        cwd,
+        plan.session_dir.as_deref(),
+        started_at,
+        fresh,
+    )
+    .await
     {
-        return Ok(Some(linked.to_string()));
-    }
-    let discovered =
-        discover_native_session(harness, home, cwd, plan.session_dir.as_deref(), started_at)
-            .await?;
-    // A linked session set aside above belongs to another checkout, so it is
-    // no fallback either.
+        Ok(discovered) => discovered,
+        // The session the run was prepared with is no evidence either: this
+        // launch may not have touched it while another one did.
+        Err(error) if error.is::<AmbiguousNativeSession>() => {
+            eprintln!(
+                "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    // A linked session `own_native_session` rejected (not in this checkout,
+    // or its native store could not be read) is no fallback either.
     Ok(discovered.or_else(|| {
         server_status
             .and_then(|status| status.native_session_id.clone())
@@ -836,6 +1203,96 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+/// Merge `--env-file` lines with `--env` entries into the final key/value
+/// list applied to the spawned harness, preserving file order but letting a
+/// `--env` entry override a same-key `--env-file` line. Values are taken
+/// literally; neither source is expanded or interpreted.
+fn resolve_run_env(
+    env_file: Option<&Path>,
+    env_args: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    if let Some(path) = env_file {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --env-file {}", path.display()))?;
+        for (line_number, line) in contents.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let (key, value) = crate::cli::parse_env_kv(trimmed)
+                .map_err(|error| anyhow!("{}:{}: {error}", path.display(), line_number + 1))?;
+            upsert_env(&mut merged, key, value);
+        }
+    }
+    for (key, value) in env_args {
+        upsert_env(&mut merged, key.clone(), value.clone());
+    }
+    Ok(merged)
+}
+
+/// Insert or replace one entry in an ordered env list, keeping the position
+/// of an existing key so `--env-file` order stays stable across overrides.
+fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|(existing_key, _)| *existing_key == key)
+    {
+        existing.1 = value;
+    } else {
+        entries.push((key, value));
+    }
+}
+
+/// The environment auto-wire resolves install targets from: the launch's own
+/// `--env` entries, adjusted where the child runs with something else. OMP
+/// ranks `--profile` above `OMP_PROFILE`, so the flag is passed on through the
+/// profile variables (see [`omp_profile_flag_env`], which reads the launch
+/// environment `launch_env`).
+fn autowire_env(
+    harness: ManagedHarness,
+    run_env: &[(String, String)],
+    native_args: &[OsString],
+    launch_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<(String, String)> {
+    let mut env = run_env.to_vec();
+    let mut set = |name: &str, value: String| {
+        env.retain(|(key, _)| key != name);
+        env.push((name.to_string(), value));
+    };
+    if harness == ManagedHarness::Omp
+        && let Some(profile) = omp_profile_flag(native_args).filter(|name| !name.is_empty())
+    {
+        for (name, value) in omp_profile_flag_env(&profile, launch_env) {
+            set(&name, value);
+        }
+    }
+    env
+}
+
+/// The launched harness's home variables (its store overrides, plus the
+/// config home Crush's managed context is built from) that are set but blank
+/// in the launch environment.
+fn blank_home_overrides(
+    harness: ManagedHarness,
+    get: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<&'static str> {
+    let crush_config: &[&'static str] = match harness {
+        ManagedHarness::Crush => &["CRUSH_GLOBAL_CONFIG", "XDG_CONFIG_HOME"],
+        _ => &[],
+    };
+    store_override_vars(harness)
+        .iter()
+        .chain(crush_config)
+        .copied()
+        .filter(|name| {
+            let value = get(name);
+            value.is_some() && ai_memory_workstream::env_dir_override(value).is_none()
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_preflighted_launch_plan(
     harness: ManagedHarness,
     executable: Option<OsString>,
@@ -844,6 +1301,7 @@ fn build_preflighted_launch_plan(
     force_fresh: bool,
     home: &Path,
     cwd: &Path,
+    env_overrides: &[(String, String)],
 ) -> Result<(LaunchPlan, Option<String>)> {
     let explicit_selector = has_native_session_selector(harness, &native_args);
     if force_fresh && explicit_selector {
@@ -852,11 +1310,13 @@ fn build_preflighted_launch_plan(
         ));
     }
     let linked_session_id = if force_fresh { None } else { linked_session_id };
-    let plan = build_launch_plan(
+    let plan = build_launch_plan_with_env(
         harness,
         executable.clone(),
         native_args.clone(),
         linked_session_id,
+        env_overrides,
+        Some(LaunchRoots { home, cwd }),
     )?;
     let Some(linked_session_id) = linked_session_id else {
         return Ok((plan, None));
@@ -873,7 +1333,14 @@ fn build_preflighted_launch_plan(
     ) {
         Ok(true) => Ok((plan, None)),
         Ok(false) => Ok((
-            build_launch_plan(harness, executable, native_args, None)?,
+            build_launch_plan_with_env(
+                harness,
+                executable,
+                native_args,
+                None,
+                env_overrides,
+                Some(LaunchRoots { home, cwd }),
+            )?,
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
@@ -1002,7 +1469,7 @@ async fn fetch_grok_context(endpoint: &ServerEndpoint, run_path: &str) -> Result
 async fn prepare_crush_context(
     endpoint: &ServerEndpoint,
     run_path: &str,
-    home: &Path,
+    source: &Path,
 ) -> Result<Option<tempfile::TempDir>> {
     let response: ManagedRunContextResponse = post_json(
         endpoint,
@@ -1015,7 +1482,19 @@ async fn prepare_crush_context(
         return Ok(None);
     };
 
-    write_crush_context_config(&crush_global_config_path(home), &context).map(Some)
+    write_crush_context_config(source, &context).map(Some)
+}
+
+/// The global `crush.json` the launched Crush reads. Crush takes a relative
+/// `CRUSH_GLOBAL_CONFIG` from its working directory, and the generated config
+/// dir (and its `crushrc`) must name the user's files absolutely because the
+/// child reads them from elsewhere.
+fn crush_context_source(
+    home: &Path,
+    cwd: &Path,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> PathBuf {
+    cwd.join(crush_global_config_path(home, get))
 }
 
 fn write_crush_context_config(source: &Path, context: &str) -> Result<tempfile::TempDir> {
@@ -1026,27 +1505,61 @@ fn write_crush_context_config(source: &Path, context: &str) -> Result<tempfile::
     let context_path = temp.path().join("managed-workstream.md");
     write_private(&context_path, context.as_bytes())?;
 
-    let mut config = if source.is_file() {
-        let raw = std::fs::read(source)
-            .with_context(|| format!("reading Crush config {}", source.display()))?;
+    // Crush cleans the path (`filepath.Join`) before reading it, so a `..`
+    // after a missing directory still reaches the file.
+    let source = ai_memory_workstream::clean_path(source);
+    let raw = if source.is_file() {
+        std::fs::read(&source)
+            .with_context(|| format!("reading Crush config {}", source.display()))?
+    } else {
+        Vec::new()
+    };
+    // Crush skips an empty file and reads `null` as unset; do the same rather
+    // than refuse a config Crush itself accepts.
+    let mut config = if raw.is_empty() {
+        serde_json::Value::Null
+    } else {
         serde_json::from_slice::<serde_json::Value>(&raw)
             .with_context(|| format!("parsing Crush config {}", source.display()))?
-    } else {
-        serde_json::json!({})
     };
+    if config.is_null() {
+        config = serde_json::json!({});
+    }
     let root = config
         .as_object_mut()
         .context("Crush global config must be a JSON object")?;
-    let options = root
-        .entry("options")
-        .or_insert_with(|| serde_json::json!({}))
+    let options = root.entry("options").or_insert(serde_json::Value::Null);
+    if options.is_null() {
+        *options = serde_json::json!({});
+    }
+    let options = options
         .as_object_mut()
         .context("Crush global config `options` must be a JSON object")?;
     let paths = options
         .entry("global_context_paths")
-        .or_insert_with(|| serde_json::json!([]))
+        .or_insert(serde_json::Value::Null);
+    if paths.is_null() {
+        *paths = serde_json::json!([]);
+    }
+    let paths = paths
         .as_array_mut()
         .context("Crush `options.global_context_paths` must be an array")?;
+    // Crush fills an empty list with `CRUSH.md` beside its global config and
+    // `AGENTS.md` one level up, but only while the list is empty, and it would
+    // resolve them against this temp dir. Seed the user's own ones first so
+    // the packet does not replace them.
+    if paths.is_empty()
+        && let Some(config_dir) = source.parent()
+    {
+        paths.push(serde_json::Value::String(
+            config_dir.join("CRUSH.md").to_string_lossy().into_owned(),
+        ));
+        if let Some(parent) = config_dir.parent() {
+            paths.push(serde_json::Value::String(
+                parent.join("AGENTS.md").to_string_lossy().into_owned(),
+            ));
+        }
+    }
     let context_path = context_path.to_string_lossy().into_owned();
     if !paths
         .iter()
@@ -1056,17 +1569,23 @@ fn write_crush_context_config(source: &Path, context: &str) -> Result<tempfile::
     }
     let rendered = serde_json::to_vec_pretty(&config).context("rendering Crush config")?;
     write_private(&temp.path().join("crush.json"), &rendered)?;
+    // Crush also runs the `crushrc` beside its global config, and with the
+    // config dir moved here it would look for one in this dir. Source the
+    // user's own from the directory Crush runs it in, so its relative paths
+    // and `source` lines still resolve. Its settings merge over the JSON
+    // above and lists concatenate, so the packet stays loaded. Unlike Crush,
+    // the default context files above are seeded even when the script adds
+    // paths of its own.
+    if let Some(config_dir) = source.parent() {
+        let crushrc = config_dir.join("crushrc");
+        if crushrc.is_file() {
+            let quote =
+                |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"));
+            let wrapper = format!("cd {} && source {}\n", quote(config_dir), quote(&crushrc));
+            write_private(&temp.path().join("crushrc"), wrapper.as_bytes())?;
+        }
+    }
     Ok(temp)
-}
-
-fn crush_global_config_path(home: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("CRUSH_GLOBAL_CONFIG").filter(|value| !value.is_empty()) {
-        return PathBuf::from(dir).join("crush.json");
-    }
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(dir).join("crush/crush.json");
-    }
-    home.join(".config/crush/crush.json")
 }
 
 fn write_private(path: &Path, content: &[u8]) -> Result<()> {
@@ -1476,6 +1995,101 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+
+    #[test]
+    fn should_prompt_yolo_requires_yolo_and_both_ttys_and_not_jailed() {
+        assert!(should_prompt_yolo(true, true, true, false));
+        assert!(
+            !should_prompt_yolo(false, true, true, false),
+            "no prompt when --yolo was not requested"
+        );
+        assert!(
+            !should_prompt_yolo(true, false, true, false),
+            "no prompt when stdin is not a TTY"
+        );
+        assert!(
+            !should_prompt_yolo(true, true, false, false),
+            "no prompt when stderr is not a TTY"
+        );
+        assert!(
+            !should_prompt_yolo(true, true, true, true),
+            "no prompt when already inside ai-jail"
+        );
+    }
+
+    #[test]
+    fn yolo_decision_defaults_to_proceed() {
+        assert!(yolo_decision(""), "empty line (bare Enter) proceeds");
+        assert!(yolo_decision("\n"));
+        assert!(yolo_decision("y"));
+        assert!(yolo_decision("Y"));
+        assert!(yolo_decision("yes"));
+        assert!(yolo_decision("YES"));
+        assert!(
+            yolo_decision("whatever"),
+            "an unrecognized line still proceeds (default yes)"
+        );
+    }
+
+    #[test]
+    fn yolo_decision_declines_only_on_explicit_no() {
+        assert!(!yolo_decision("n"));
+        assert!(!yolo_decision("N"));
+        assert!(!yolo_decision("no"));
+        assert!(!yolo_decision("NO\n"));
+    }
+
+    #[test]
+    fn read_yolo_confirmation_default_enter_proceeds_without_jail_offer() {
+        let mut input = Cursor::new(b"\n".to_vec());
+        let mut output = Vec::new();
+        let confirmation = read_yolo_confirmation(false, &mut input, &mut output).unwrap();
+        assert_eq!(
+            confirmation,
+            YoloConfirmation {
+                proceed: true,
+                jail: false
+            }
+        );
+        let printed = String::from_utf8(output).unwrap();
+        assert!(printed.contains("Proceed? [Y/n]"));
+        assert!(!printed.contains("ai-jail is installed"));
+    }
+
+    #[test]
+    fn read_yolo_confirmation_decline_aborts_before_the_jail_offer() {
+        let mut input = Cursor::new(b"n\n".to_vec());
+        let mut output = Vec::new();
+        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        assert_eq!(
+            confirmation,
+            YoloConfirmation {
+                proceed: false,
+                jail: false
+            }
+        );
+        let printed = String::from_utf8(output).unwrap();
+        assert!(
+            !printed.contains("ai-jail is installed"),
+            "declining --yolo must never reach the ai-jail offer"
+        );
+    }
+
+    #[test]
+    fn read_yolo_confirmation_offers_ai_jail_and_reads_its_answer() {
+        let mut input = Cursor::new(b"\nn\n".to_vec());
+        let mut output = Vec::new();
+        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        assert_eq!(
+            confirmation,
+            YoloConfirmation {
+                proceed: true,
+                jail: false
+            }
+        );
+        let printed = String::from_utf8(output).unwrap();
+        assert!(printed.contains("ai-jail is installed. Re-run this session inside it? [Y/n]"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn native_session_choice_interrupt_does_not_wait_for_input() {
@@ -2149,6 +2763,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2213,6 +2828,171 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_env_merges_file_then_overrides_with_cli_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.env");
+        std::fs::write(&path, "# a comment\n\n  \nFOO=from-file\nBAR=keep\n").unwrap();
+
+        let cli_pairs = vec![("FOO".to_string(), "from-cli".to_string())];
+        let merged = resolve_run_env(Some(&path), &cli_pairs).unwrap();
+
+        assert_eq!(
+            merged,
+            vec![
+                ("FOO".to_string(), "from-cli".to_string()),
+                ("BAR".to_string(), "keep".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_run_env_without_a_file_returns_only_cli_pairs() {
+        let cli_pairs = vec![("A".to_string(), "1".to_string())];
+        let merged = resolve_run_env(None, &cli_pairs).unwrap();
+        assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn resolve_run_env_rejects_a_malformed_env_file_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.env");
+        std::fs::write(&path, "NOVALUE\n").unwrap();
+        let error = resolve_run_env(Some(&path), &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("expected KEY=VALUE"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn build_launch_plan_with_env_overrides_reach_native_session_resolution() {
+        // The same override list is what `run.rs` also applies to the spawned
+        // child's `Command`; proving it steers `session_dir` here proves
+        // ai-memory's own native-session resolution and the harness process
+        // agree on a caller-supplied `CLAUDE_CONFIG_DIR`, per the docs note
+        // this closes (#820).
+        let overrides = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/accounts/work".to_string(),
+        )];
+        let plan = build_launch_plan_with_env(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            None,
+            &overrides,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.session_dir.as_deref(),
+            Some(Path::new("/accounts/work/projects"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_env_reaches_the_spawned_child_and_overrides_env_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::commands::run_autowire::WireOverrides;
+        use crate::config::Config;
+
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+
+        let captured = repo.path().join("captured-env");
+        let script = repo.path().join("capture-env-harness");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'FOO=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
+                captured.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_file = repo.path().join("run.env");
+        std::fs::write(
+            &env_file,
+            "# comment\n\nFOO=from-file\nCLAUDE_CONFIG_DIR=/from/file\n",
+        )
+        .unwrap();
+
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = false;
+
+        let args = RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(script.clone()),
+            yolo: false,
+            true_yolo: false,
+            fresh: false,
+            no_autowire: true,
+            env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
+            env_file: Some(env_file.clone()),
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: vec![OsString::from("--version")],
+        };
+
+        let overrides = WireOverrides::default();
+        let exit = run_from_with_wiring(&config, args, repo.path(), &overrides)
+            .await
+            .expect("managed passthrough run completes");
+        assert_eq!(exit, 0, "the harmless child exits 0");
+
+        let captured_env = std::fs::read_to_string(&captured).unwrap();
+        assert!(
+            captured_env.contains("FOO=from-file"),
+            "an --env-file entry not overridden by --env must reach the spawned child: {captured_env}"
+        );
+        assert!(
+            captured_env.contains("CLAUDE_CONFIG_DIR=/from/cli"),
+            "--env must override a same-key --env-file entry for the spawned child: {captured_env}"
+        );
+
+        server.abort();
+    }
+
+    #[test]
     fn missing_linked_session_starts_fresh_but_explicit_selectors_win() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
@@ -2242,6 +3022,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -2257,6 +3038,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert_eq!(orphaned.as_deref(), Some("linked"));
@@ -2275,6 +3057,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -2294,6 +3077,7 @@ mod tests {
             true,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -2308,6 +3092,7 @@ mod tests {
             true,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
@@ -2355,12 +3140,27 @@ mod tests {
             context_delivered: true,
             state: "active".to_string(),
         };
-        for (linked, native, expected) in [
-            (true, "prepared", Some("prepared")),
-            (false, "prepared", Some("concurrent-newer")),
-            (true, "nested", Some("concurrent-newer")),
+        for (linked, native, expected, own) in [
+            (true, "prepared", Some("prepared"), Some("prepared")),
+            (false, "prepared", Some("concurrent-newer"), None),
+            (true, "nested", Some("concurrent-newer"), None),
         ] {
             let status = status(linked, native);
+            // Only a session the run can prove is its own: never a discovered
+            // one, which may be a concurrent launch's (#941 finalizes it).
+            assert_eq!(
+                own_native_session(
+                    &plan,
+                    ManagedHarness::Codex,
+                    temp.path(),
+                    &cwd,
+                    Some(&status)
+                )
+                .unwrap()
+                .as_deref(),
+                own,
+                "own: linked={linked} native={native}"
+            );
             assert_eq!(
                 resolve_native_session_after_run(
                     &plan,
@@ -2466,6 +3266,77 @@ mod tests {
         );
     }
 
+    /// Two new Crush sessions in one store cannot be told apart, and that is
+    /// reported without cancelling the finished run or falling back to the
+    /// session the run was prepared with, which another launch may have
+    /// moved. With no ambiguity a fresh run that created nothing keeps that
+    /// session, and `--continue` claims the session it resumed.
+    #[tokio::test]
+    async fn ambiguous_crush_discovery_keeps_the_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let started = 1_900_000_000_i64;
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(started as u64);
+        let store = |name: &str, sessions: &[(&str, i64, i64)]| {
+            // Inside the checkout: a store only this project uses.
+            let data = cwd.join(name);
+            std::fs::create_dir_all(&data).unwrap();
+            let connection = rusqlite::Connection::open(data.join("crush.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                     updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL);",
+                )
+                .unwrap();
+            for (id, created, updated) in sessions {
+                connection
+                    .execute(
+                        "INSERT INTO sessions VALUES (?1, NULL, ?2, ?3)",
+                        rusqlite::params![id, started + updated, started + created],
+                    )
+                    .unwrap();
+            }
+            data
+        };
+        let crowded = store(
+            "crowded",
+            &[("continued", -1_000, 30), ("a", 5, 20), ("b", 8, 10)],
+        );
+        let quiet = store("quiet", &[("continued", -1_000, 30)]);
+        let status = ManagedRunStatus {
+            run_id: ManagedRunId::new(),
+            workstream_id: WorkstreamId::new(),
+            agent: AgentKind::Crush,
+            native_session_id: Some("prepared".to_string()),
+            native_session_linked: false,
+            context_delivered: false,
+            state: "active".to_string(),
+        };
+        let resolve = async |data: &Path, extra: &[&str]| {
+            let mut args = vec![OsString::from("--data-dir"), data.as_os_str().to_owned()];
+            args.extend(extra.iter().map(OsString::from));
+            let plan = build_launch_plan(ManagedHarness::Crush, None, args, None).unwrap();
+            resolve_native_session_after_run(
+                &plan,
+                ManagedHarness::Crush,
+                temp.path(),
+                &cwd,
+                started_at,
+                Some(&status),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(resolve(&crowded, &[]).await, None);
+        assert_eq!(resolve(&crowded, &["--continue"]).await, None);
+        assert_eq!(resolve(&quiet, &[]).await.as_deref(), Some("prepared"));
+        assert_eq!(
+            resolve(&quiet, &["--continue"]).await.as_deref(),
+            Some("continued")
+        );
+    }
+
     #[test]
     fn crush_context_config_preserves_user_settings_and_adds_packet() {
         let source_dir = tempfile::tempdir().unwrap();
@@ -2497,7 +3368,7 @@ mod tests {
     /// The `ai-memory run` -> autowire -> child-spawn seam: driving the launcher
     /// entry point (`run_from_with_wiring`) must run auto-wire *before* the child
     /// starts, so the harness's ai-memory hooks + MCP are installed and the
-    /// per-(agent, version) sentinel is written as a side effect of `run` itself.
+    /// auto-wire sentinel is written as a side effect of `run` itself.
     /// The autowire path injections keep it off the developer's real `$HOME`, the
     /// child is a harmless `exit 0` script launched in passthrough mode
     /// (`--version`), and a mock server stands in for the workstream endpoints, so
@@ -2570,6 +3441,7 @@ mod tests {
             hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
             hooks_config_file: Some(settings.clone()),
             mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
         };
         let args = || RunArgs {
             workspace: Some("ws".into()),
@@ -2578,8 +3450,11 @@ mod tests {
             new_workstream: None,
             executable: Some(script.clone()),
             yolo: false,
+            true_yolo: false,
             fresh: false,
             no_autowire: false,
+            env: Vec::new(),
+            env_file: None,
             harness: Some(RunHarnessChoice::Claude),
             native_args: vec![OsString::from("--version")],
         };
@@ -2609,10 +3484,12 @@ mod tests {
             mcp_json.contains("ai-memory"),
             "run must auto-install the ai-memory MCP server before spawning: {mcp_json}"
         );
-        let sentinels = std::fs::read_dir(data.path().join("autowire-state"))
-            .expect("autowire-state dir created by the run")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+        let sentinels = std::fs::read_dir(crate::commands::run_autowire::autowire_state_dir(
+            data.path(),
+        ))
+        .expect("autowire-state dir created by the run")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
         assert!(
             sentinels
                 .iter()
@@ -2638,6 +3515,707 @@ mod tests {
             "a gated re-launch must not rewrite MCP config"
         );
 
+        server.abort();
+    }
+
+    /// A mock workstream server for launches driven through `run_from`: it
+    /// prepares a run, linked to `native_session_id` when one is given, and
+    /// accepts the link and the finish.
+    #[cfg(unix)]
+    async fn mock_workstream_server(
+        native_session_id: Option<&'static str>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(move || async move {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: native_session_id.map(str::to_owned),
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/link",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    #[cfg(unix)]
+    fn capture_env_script(dir: &Path, variable: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let captured = dir.join("captured-env");
+        let script = dir.join("capture-env-harness");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{{variable}-unset}}\" > {}\nexit 0\n",
+                captured.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, captured)
+    }
+
+    #[cfg(unix)]
+    fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
+        let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
+        config.data_dir = data.to_path_buf();
+        config.home_dir = Some(home.to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = true;
+        config
+    }
+
+    #[cfg(unix)]
+    fn run_args(
+        harness: RunHarnessChoice,
+        executable: PathBuf,
+        env: Vec<(String, String)>,
+        native_args: &[&str],
+    ) -> RunArgs {
+        RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(executable),
+            yolo: false,
+            true_yolo: false,
+            fresh: false,
+            no_autowire: false,
+            env,
+            env_file: None,
+            harness: Some(harness),
+            native_args: native_args.iter().map(OsString::from).collect(),
+        }
+    }
+
+    /// `run` must hand its `--env` to auto-wire, or a relocated config home
+    /// launches without hooks or MCP. The guard refuses every install outside
+    /// the test's data dir, so if `run` dropped the env nothing is written at
+    /// all, least of all to the real home.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_entry_point_passes_run_env_to_autowire() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let claude_home = data.path().join("claude-home");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let config = launch_config(home.path(), data.path(), address);
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+        let env = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_home.display().to_string(),
+        )];
+        let exit = run_from_with_wiring(
+            &config,
+            run_args(RunHarnessChoice::Claude, script, env, &["--version"]),
+            repo.path(),
+            &overrides,
+        )
+        .await
+        .expect("managed passthrough run completes");
+        assert_eq!(exit, 0);
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            claude_home.display().to_string()
+        );
+
+        let settings = claude_home.join("settings.json");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory")),
+            "hooks missing in {}",
+            settings.display()
+        );
+        let mcp = claude_home.join(".claude.json");
+        assert!(
+            std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+            "MCP missing in {}",
+            mcp.display()
+        );
+
+        server.abort();
+    }
+
+    /// A Kiro v3 session stored under the default home is resumed with
+    /// `KIRO_HOME` removed from the child, so auto-wire must wire that default
+    /// home. Wiring the `--env` home instead left the resumed session with no
+    /// hooks and no MCP.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kiro_v3_default_store_resume_autowires_the_home_the_child_reads() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        const SESSION: &str = "sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e";
+        let (address, server) = mock_workstream_server(Some(SESSION)).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "KIRO_HOME");
+
+        let session_dir = home
+            .path()
+            .join(".kiro/sessions/checkout-fixture")
+            .join(SESSION);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::json!({
+                "schemaVersion": "1.0.0",
+                "dataModelVersion": 1,
+                "id": SESSION,
+                "workspacePaths": [repo.path()],
+                "createdAt": "2026-08-06T10:00:00Z",
+                "lastModifiedAt": "2026-08-06T10:05:00Z",
+                "agentMode": "vibe",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(session_dir.join("messages.jsonl"), "{}\n").unwrap();
+        let custom = home.path().join("custom-kiro");
+        std::fs::create_dir_all(custom.join("sessions")).unwrap();
+
+        let config = launch_config(home.path(), data.path(), address);
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(home.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+        let env = vec![("KIRO_HOME".to_string(), custom.display().to_string())];
+        let exit = run_from_with_wiring(
+            &config,
+            run_args(RunHarnessChoice::Kiro, script, env, &["--v3"]),
+            repo.path(),
+            &overrides,
+        )
+        .await
+        .expect("managed Kiro v3 resume completes");
+        assert_eq!(exit, 0);
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            "unset",
+            "the default-store resume must drop KIRO_HOME from the child"
+        );
+
+        let kiro_default = home.path().join(".kiro");
+        let hooks = kiro_default.join("hooks").join("ai-memory.json");
+        assert!(
+            std::fs::read_to_string(&hooks).is_ok_and(|s| s.contains("ai-memory")),
+            "hooks missing in {}",
+            hooks.display()
+        );
+        let mcp = kiro_default.join("settings").join("mcp.json");
+        assert!(
+            std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+            "MCP missing in {}",
+            mcp.display()
+        );
+        assert!(
+            !custom.join("hooks").exists() && !custom.join("settings").exists(),
+            "the KIRO_HOME the child no longer reads must stay untouched"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn blank_home_overrides_names_only_blank_home_variables() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            blank_home_overrides(ManagedHarness::Claude, &env(&[("CLAUDE_CONFIG_DIR", "  ")])),
+            ["CLAUDE_CONFIG_DIR"]
+        );
+        assert!(
+            blank_home_overrides(ManagedHarness::Claude, &env(&[("CLAUDE_CONFIG_DIR", "/x")]))
+                .is_empty()
+        );
+        assert!(blank_home_overrides(ManagedHarness::Claude, &env(&[])).is_empty());
+        assert!(
+            blank_home_overrides(ManagedHarness::Codex, &env(&[("CLAUDE_CONFIG_DIR", "")]))
+                .is_empty(),
+            "only the launched harness's own variables"
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Pi,
+                &env(&[
+                    ("PI_CODING_AGENT_SESSION_DIR", ""),
+                    ("PI_CODING_AGENT_DIR", "/x")
+                ])
+            ),
+            ["PI_CODING_AGENT_SESSION_DIR"]
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Omp,
+                &env(&[
+                    ("PI_CODING_AGENT_SESSION_DIR", ""),
+                    ("PI_CODING_AGENT_DIR", "/x")
+                ])
+            ),
+            ["PI_CODING_AGENT_SESSION_DIR"]
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Omp,
+                &env(&[("PI_CONFIG_DIR", " "), ("XDG_DATA_HOME", "")])
+            ),
+            ["PI_CONFIG_DIR", "XDG_DATA_HOME"]
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Crush,
+                &env(&[("CRUSH_GLOBAL_CONFIG", "  "), ("XDG_CONFIG_HOME", "/x")])
+            ),
+            ["CRUSH_GLOBAL_CONFIG"]
+        );
+        assert!(
+            blank_home_overrides(ManagedHarness::Claude, &env(&[("XDG_CONFIG_HOME", "")]))
+                .is_empty(),
+            "Crush's config home is Crush's alone"
+        );
+    }
+
+    /// The managed Crush context layers onto the global config the child
+    /// would read: `--env` over ai-memory's own environment, blank as unset.
+    /// A relative `CRUSH_GLOBAL_CONFIG` is read from the launch directory, as
+    /// Crush reads it, so the generated config and `crushrc` do not point at
+    /// paths the child would resolve from its temporary config dir.
+    #[test]
+    fn crush_context_source_is_anchored_at_the_launch_dir() {
+        let home = Path::new("/home/user");
+        let cwd = Path::new("/work/repo");
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            crush_context_source(home, cwd, env(&[("CRUSH_GLOBAL_CONFIG", "cfg")])),
+            cwd.join("cfg").join("crush.json")
+        );
+        assert_eq!(
+            crush_context_source(home, cwd, env(&[])),
+            home.join(".config").join("crush").join("crush.json")
+        );
+    }
+
+    #[test]
+    fn crush_global_config_path_follows_the_launch_env() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let home = Path::new("/home/me");
+        let default = home.join(".config").join("crush").join("crush.json");
+        assert_eq!(
+            crush_global_config_path(
+                home,
+                env(&[
+                    ("CRUSH_GLOBAL_CONFIG", "/team/crush"),
+                    ("XDG_CONFIG_HOME", "/xdg")
+                ])
+            ),
+            Path::new("/team/crush").join("crush.json")
+        );
+        assert_eq!(
+            crush_global_config_path(home, env(&[("XDG_CONFIG_HOME", "/xdg")])),
+            Path::new("/xdg").join("crush").join("crush.json")
+        );
+        assert_eq!(
+            crush_global_config_path(
+                home,
+                env(&[("CRUSH_GLOBAL_CONFIG", "  "), ("XDG_CONFIG_HOME", "")])
+            ),
+            default,
+            "blank counts as unset"
+        );
+        assert_eq!(crush_global_config_path(home, env(&[])), default);
+    }
+
+    /// Crush skips an empty config and reads `null` as unset, so neither may
+    /// stop a managed launch.
+    #[test]
+    fn crush_context_config_accepts_what_crush_accepts() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("empty", ""),
+            ("null-options", r#"{"options": null}"#),
+            (
+                "null-paths",
+                r#"{"options": {"global_context_paths": null}}"#,
+            ),
+            ("null", "null"),
+        ] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("crush.json");
+            std::fs::write(&source, content).unwrap();
+            let generated = write_crush_context_config(&source, "managed packet")
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(generated.path().join("crush.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                config["options"]["global_context_paths"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(3),
+                "{name}: {config}"
+            );
+        }
+    }
+
+    /// Crush cleans the config path before reading it and deriving its default
+    /// context files, so a `..` in `CRUSH_GLOBAL_CONFIG` moves neither.
+    #[test]
+    fn crush_default_context_files_follow_the_cleaned_config_path() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("crush.json"), r#"{"marker": 1}"#).unwrap();
+        // `missing` does not exist: only a cleaned path reaches the file.
+        let source = config_dir.join("missing").join("..").join("crush.json");
+
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generated.path().join("crush.json")).unwrap())
+                .unwrap();
+        let paths: Vec<&str> = config["options"]["global_context_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(Path::new(paths[0]), config_dir.join("CRUSH.md"));
+        assert_eq!(Path::new(paths[1]), root.path().join("AGENTS.md"));
+        assert_eq!(config["marker"], 1, "the user's config was read");
+    }
+
+    /// Crush only fills in its default `CRUSH.md` / `AGENTS.md` while
+    /// `global_context_paths` is empty, so the packet must not displace the
+    /// user's own files.
+    #[test]
+    fn crush_context_config_keeps_crush_default_context_files() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config").join("crush");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let source = config_dir.join("crush.json");
+        std::fs::write(&source, r#"{"options": {"debug": true}}"#).unwrap();
+
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generated.path().join("crush.json")).unwrap())
+                .unwrap();
+        let paths: Vec<&str> = config["options"]["global_context_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(Path::new(paths[0]), config_dir.join("CRUSH.md"));
+        assert_eq!(
+            Path::new(paths[1]),
+            root.path().join("config").join("AGENTS.md")
+        );
+        assert_eq!(std::fs::read_to_string(paths[2]).unwrap(), "managed packet");
+    }
+
+    /// Crush runs the `crushrc` beside its global config, and moving the
+    /// config dir for the context packet would drop the user's. The generated
+    /// dir sources it from its own directory, so relative `source` lines keep
+    /// working, whatever the path contains.
+    #[cfg(unix)]
+    #[test]
+    fn crush_context_config_carries_the_global_crushrc() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let config_dir = root.join("it's my crush");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let source = config_dir.join("crush.json");
+
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        assert!(!generated.path().join("crushrc").exists());
+
+        std::fs::write(config_dir.join("crushrc"), "source ./extra\n").unwrap();
+        std::fs::write(config_dir.join("extra"), "pwd > \"$OUT\"\n").unwrap();
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        let out = root.join("out");
+        // Crush runs a crushrc from its own directory.
+        let status = std::process::Command::new("bash")
+            .arg(generated.path().join("crushrc"))
+            .current_dir(generated.path())
+            .env("OUT", &out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap().trim_end(),
+            config_dir.to_str().unwrap()
+        );
+    }
+
+    /// The launched harness must not see a blank store override that session
+    /// import and auto-wire treat as unset, or it reads a blank-named
+    /// directory nothing else follows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_blank_store_override_is_dropped_from_the_child() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let config = launch_config(home.path(), data.path(), address);
+        let mut args = run_args(
+            RunHarnessChoice::Claude,
+            script,
+            vec![("CLAUDE_CONFIG_DIR".to_string(), "   ".to_string())],
+            &["--version"],
+        );
+        args.no_autowire = true;
+        let exit = run_from_with_wiring(&config, args, repo.path(), &WireOverrides::default())
+            .await
+            .expect("managed passthrough run completes");
+        assert_eq!(exit, 0);
+        assert_eq!(std::fs::read_to_string(&captured).unwrap(), "unset");
+
+        server.abort();
+    }
+
+    /// OMP ranks `--profile` above `OMP_PROFILE`, so auto-wire sees what the
+    /// child will run with; everything else in `--env` passes through
+    /// untouched.
+    #[test]
+    fn autowire_env_follows_what_the_child_runs_with() {
+        let run_env = vec![
+            ("OMP_PROFILE".to_string(), "other".to_string()),
+            ("KIRO_HOME".to_string(), "/custom".to_string()),
+            ("FOO".to_string(), "x".to_string()),
+        ];
+        let lookup = |env: &[(String, String)], name: &str| {
+            let values: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .collect();
+            values
+        };
+        // Only the run_env: no process environment leaks into the test.
+        let only = |env: Vec<(String, String)>| {
+            move |name: &str| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let launch = only(run_env.clone());
+
+        let args = [OsString::from("--profile"), OsString::from("work")];
+        let omp = autowire_env(ManagedHarness::Omp, &run_env, &args, &launch);
+        assert_eq!(lookup(&omp, "OMP_PROFILE"), ["work"]);
+        assert_eq!(lookup(&omp, "KIRO_HOME"), ["/custom"]);
+        assert_eq!(lookup(&omp, "FOO"), ["x"]);
+        assert_eq!(
+            autowire_env(ManagedHarness::Pi, &run_env, &args, &launch),
+            run_env,
+            "only OMP reads --profile"
+        );
+        assert_eq!(
+            autowire_env(ManagedHarness::Omp, &run_env, &[], &launch),
+            run_env
+        );
+
+        // `--profile default` under an environment a profiled parent OMP
+        // exported: OMP drops the inherited agent dir, and so must auto-wire.
+        let home = Path::new("/home/me");
+        let inherited = vec![
+            ("OMP_PROFILE".to_string(), "work".to_string()),
+            (
+                "PI_CODING_AGENT_DIR".to_string(),
+                "/home/me/.omp/profiles/work/agent".to_string(),
+            ),
+            ("PI_CONFIG_DIR".to_string(), String::new()),
+        ];
+        let default_args = [OsString::from("--profile"), OsString::from("default")];
+        let wired = autowire_env(
+            ManagedHarness::Omp,
+            &inherited,
+            &default_args,
+            &only(inherited.clone()),
+        );
+        assert_eq!(
+            ai_memory_workstream::omp_agent_dir(home, None, only(wired)).unwrap(),
+            home.join(".omp").join("agent")
+        );
+    }
+
+    /// Harnesses without a native session-end hook get their session closed
+    /// when the managed run ends (#941): the exact session is looked up by the
+    /// stored id its native id maps to, and a synthetic session-end is posted.
+    /// Harnesses with their own hook, and runs with no session, are left alone.
+    #[tokio::test]
+    async fn run_end_finalizes_the_session_of_a_hookless_harness() {
+        use std::sync::Mutex;
+
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+
+        use crate::config::Config;
+
+        #[derive(Default)]
+        struct Seen {
+            lookups: Vec<std::collections::HashMap<String, String>>,
+            batches: Vec<serde_json::Value>,
+        }
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let app = Router::new()
+            .route(
+                "/admin/open-sessions",
+                get(
+                    |State(seen): State<Arc<Mutex<Seen>>>,
+                     Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                        let session_id = query.get("session_id").cloned().unwrap_or_default();
+                        seen.lock().unwrap().lookups.push(query);
+                        axum::Json(serde_json::json!({
+                            "sessions": [{ "session_id": session_id, "cwd": "/tmp/repo" }]
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/hook/batch",
+                post(
+                    |State(seen): State<Arc<Mutex<Seen>>>, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        seen.lock().unwrap().batches.push(body);
+                        axum::Json(serde_json::json!({ "accepted": 1 }))
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.server_url = format!("http://{address}");
+
+        assert!(
+            finalize_hookless_session(
+                &config,
+                ManagedHarness::Claude,
+                Some("claude-1"),
+                "ws",
+                "proj"
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            finalize_hookless_session(&config, ManagedHarness::Antigravity, None, "ws", "proj")
+                .await
+                .is_none()
+        );
+        assert!(
+            seen.lock().unwrap().lookups.is_empty(),
+            "nothing to finalize yet"
+        );
+
+        let (session, finalized) = finalize_hookless_session(
+            &config,
+            ManagedHarness::Antigravity,
+            Some("agy-session-1"),
+            "ws",
+            "proj",
+        )
+        .await
+        .expect("a hookless harness with its own session is finalized");
+        let stored = SessionId::from_native("agy-session-1").to_string();
+        assert_eq!(session.to_string(), stored);
+        assert_eq!(finalized.unwrap(), vec![stored.clone()]);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.lookups.len(), 1, "one exact-session lookup");
+        let lookup = &seen.lookups[0];
+        assert_eq!(
+            lookup.get("session_id"),
+            Some(&stored),
+            "looked up by the stored id"
+        );
+        assert_eq!(
+            lookup.get("agent").map(String::as_str),
+            Some("antigravity-cli")
+        );
+        assert_eq!(lookup.get("workspace").map(String::as_str), Some("ws"));
+        assert_eq!(lookup.get("project").map(String::as_str), Some("proj"));
+        assert_eq!(
+            lookup.get("include_ended").map(String::as_str),
+            Some("true"),
+            "a resumed session that was already ended is ended again"
+        );
+        assert_eq!(seen.batches.len(), 1, "one synthetic session-end batch");
+        assert!(
+            seen.batches[0].to_string().contains(&stored),
+            "the session-end targets that session: {}",
+            seen.batches[0]
+        );
+        drop(seen);
         server.abort();
     }
 }
