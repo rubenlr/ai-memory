@@ -142,12 +142,16 @@ wait_for_active() {
 
 run_container() {
   local extra_args=("$@")
-  # Privileged + host cgroup namespace: systemd as PID 1 on cgroup v2 hosts
-  # (including GitHub Actions ubuntu-latest) needs this to activate units.
+  # Privileged + host cgroup/user namespaces: systemd as PID 1 on cgroup v2
+  # hosts (including GitHub Actions ubuntu-latest) needs this to activate
+  # units. Host userns avoids Podman userns=auto exhausting subuid ranges
+  # (or looking for a missing `containers` pool user). Outer harness only —
+  # the guest still runs ai-memory as the isolated module user + sandbox.
   # No -p: default --bind is 127.0.0.1; published ports never reach it.
   "${ENGINE}" run -d --name "${CONTAINER_NAME}" \
     --privileged \
     --cgroupns=host \
+    --userns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     "${extra_args[@]}" \
     "${IMAGE_NAME}" /init
